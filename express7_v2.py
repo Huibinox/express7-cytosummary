@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Flow cytometry summary V3.4.3 — SQLite + Tkinter/CustomTkinter + openpyxl.
+"""Flow cytometry summary V3.4.4 — SQLite + Tkinter/CustomTkinter + openpyxl.
 Run: py express7_v2.py
 Business rules and installation are documented in 使用说明.txt.
 """
@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.4.3'
+VERSION = '3.4.4'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -1759,12 +1759,14 @@ class Store:
             else: data['parent_dependencies'].append({'panel':ident,'missing_or_other_project':True})
         return hashlib.sha256(dumps(data).encode('utf-8')).hexdigest()
 
-    def summary_status(self, panel):
+    def summary_status(self, panel, exclude_fail=False):
         token = self.summary_token(panel)
-        for row in self.db.execute("SELECT detail FROM audit WHERE project_id=? AND action='导出Excel' ORDER BY id DESC",(self.panel(panel)['project_id'],)):
+        for row in self.db.execute("SELECT detail,stamp FROM audit WHERE project_id=? AND action='导出Excel' ORDER BY id DESC",(self.panel(panel)['project_id'],)):
             info=json.loads(row[0])
             if info.get('panel')==panel:
-                return {'ready':info.get('summary_token')==token,'token':token,'destination':info.get('destination','')}
+                return {'ready':info.get('summary_token')==token and info.get('exclude_fail',False)==exclude_fail,
+                        'token':token,'destination':info.get('destination',''),
+                        'exclude_fail':info.get('exclude_fail',False),'rows':info.get('rows'), 'stamp':row['stamp']}
         return {'ready':False,'token':token,'destination':''}
 
 
@@ -1789,7 +1791,7 @@ class Store:
             if records and excluded==len(records): issues.append('排除F后没有可汇报结果')
             checks.append({'panel_id':ident,'panel_name':panel['name'],'current':len(records),'pending':len(pending),
                            'ready':ready,'excluded':excluded,'issues':list(dict.fromkeys(issues)),
-                           'summary_ready':self.summary_status(ident)['ready']})
+                            'summary_ready':self.summary_status(ident,exclude_fail)['ready']})
         return {'panels':checks,'files':self.unresolved_imports(pid)}
 
     def unresolved_imports(self, pid):
@@ -2323,7 +2325,10 @@ class Store:
         outcomes = []; new_ids = []; warnings = []
         excluded = {r[0] for r in self.db.execute('SELECT path FROM exclusions')}
         self.backup()
-        for path in paths:
+        progress=getattr(self,'progress',lambda message:None)
+        panel_name=self.panel(panel)['name']
+        for index,path in enumerate(paths,1):
+            progress(f'{panel_name} · 文件 {index}/{len(paths)}：{Path(path).name}')
             if path in excluded:
                 outcomes.append({'file':path,'status':'跳过','detail':'已登记为受试者资料或程序导出文件','ids':[],'duplicate':0})
                 continue
@@ -2337,6 +2342,7 @@ class Store:
             new_ids.extend(ids); warnings.extend(result['warnings'])
             detail='原文件未变化，已跳过重复导入' if result.get('unchanged_files') else ('结果重复，未新增记录' if result['duplicate'] and not ids else '整份文件已处理')
             outcomes.append({'file':path,'status':'成功','detail':detail,'ids':ids,'duplicate':result['duplicate']})
+        progress(f'{panel_name} · 文件读取完成，正在整理重复记录和待审核项…')
         with self.db:
             groups = {}
             for ident in new_ids:
@@ -3254,6 +3260,88 @@ class ResultTree(ttk.Treeview):
         if not self.get_children(): self._stripe_number=0
 
 
+class PagedTable:
+    """Keep all display rows in memory, but only mount one page in Tk."""
+    def __init__(self, app, tree, run_column=None):
+        self.app=app;self.tree=tree;self.run_column=run_column
+        self.rows=[];self.filtered=[];self.page=0;self.context=None;self.red_cells={};self.pending=None
+        self.query=tk.StringVar();self.run=tk.StringVar();self.size=tk.StringVar(value='200')
+        self.only_issues=tk.BooleanVar(value=False);self.caption=tk.StringVar()
+        bar=ttk.Frame(tree.master);bar.grid(row=2,column=0,columnspan=2,sticky='ew',pady=(6,0))
+        ttk.Label(bar,text='搜索').pack(side='left')
+        ttk.Entry(bar,textvariable=self.query,width=20).pack(side='left',padx=5)
+        if run_column is not None:
+            ttk.Label(bar,text='Run').pack(side='left')
+            ttk.Entry(bar,textvariable=self.run,width=7).pack(side='left',padx=5)
+        ttk.Button(bar,text='显示全部',command=self.reset).pack(side='left',padx=3)
+        ttk.Button(bar,text='上一页',command=lambda:self.turn(-1)).pack(side='left',padx=3)
+        ttk.Button(bar,text='下一页',command=lambda:self.turn(1)).pack(side='left',padx=3)
+        ttk.Combobox(bar,textvariable=self.size,values=['100','200','500'],state='readonly',width=5).pack(side='left',padx=5)
+        ttk.Label(bar,textvariable=self.caption).pack(side='left',padx=5)
+        for v in (self.query,self.run,self.size):v.trace_add('write',self.schedule_filter)
+        tree.page_view=self
+        tree.bind('<Destroy>',self.close,add='+')
+
+    def close(self,event):
+        if event.widget==self.tree and self.pending:
+            self.tree.after_cancel(self.pending);self.pending=None
+
+    def schedule_filter(self,*_):
+        if self.pending:self.tree.after_cancel(self.pending)
+        self.pending=self.tree.after(250,self.apply_filter)
+
+    def reset(self):
+        self.query.set('');self.run.set('');self.only_issues.set(False);self.apply_filter()
+
+    def show_issues(self):
+        self.query.set('');self.run.set('');self.only_issues.set(True);self.apply_filter()
+
+    def set_rows(self,rows,red_cells,context):
+        selected=self.tree.selection()
+        if self.context!=context:
+            self.query.set('');self.run.set('');self.only_issues.set(False);self.page=0
+        self.context=context;self.rows=rows;self.red_cells=red_cells
+        # Precompute search text once per refresh, not for each key stroke.
+        self.search_text={r['iid']:' '.join(txt(v) for v in r['values']).casefold() for r in rows}
+        self.apply_filter(reset_page=False,selected=selected)
+
+    def apply_filter(self,reset_page=True,selected=()):
+        if self.pending:self.tree.after_cancel(self.pending);self.pending=None
+        if reset_page:self.page=0
+        words=self.query.get().casefold().split();run=re.sub(r'(?i)^run\s*','',self.run.get().strip())
+        issues={iid for iid,col in self.red_cells}
+        self.filtered=[r for r in self.rows if
+            all(w in self.search_text.get(r['iid'],'') for w in words)
+            and (not self.only_issues.get() or r['iid'] in issues)
+            and (not run or self.run_column is None or re.sub(r'(?i)^run\s*','',txt(r['values'][self.run_column]))==run)]
+        self.sort_rows();self.render(selected)
+
+    def sort_rows(self):
+        if not hasattr(self.tree,'sort_state'):return
+        col,descending=self.tree.sort_state
+        filled=[r for r in self.filtered if txt(r['values'][col])]
+        empty=[r for r in self.filtered if not txt(r['values'][col])]
+        filled.sort(key=lambda r:natural_sort_key(r['values'][col]),reverse=descending)
+        self.filtered=filled+empty
+
+    def turn(self,delta):
+        self.page+=delta;self.render()
+
+    def render(self,selected=()):
+        self.app.close_pf_dropdown()
+        size=int(self.size.get());pages=max(1,(len(self.filtered)+size-1)//size)
+        self.page=max(0,min(self.page,pages-1))
+        self.tree.delete(*self.tree.get_children())
+        shown=self.filtered[self.page*size:(self.page+1)*size]
+        for row in shown:self.tree.insert('','end',**row)
+        visible={r['iid'] for r in shown}
+        self.tree.set_red_cells({k:v for k,v in self.red_cells.items() if k[0] in visible})
+        retained=[iid for iid in selected if iid in visible]
+        if retained:self.tree.selection_set(retained)
+        scope='异常筛选 · ' if self.only_issues.get() else ''
+        self.caption.set(f'{scope}{len(self.filtered)}/{len(self.rows)} 条 · 第 {self.page+1}/{pages} 页')
+
+
 class StartupCancelled(Exception):
     pass
 
@@ -3669,21 +3757,25 @@ class App(tk.Tk):
         return panel,ids,validation_metrics(items),threshold
 
     def validation_preview(self):
-        args=self.validation_inputs();items,rows=self.store.validation_report(*args)
-        win=tk.Toplevel(self);win.title('验证CV（Control不参与）');win.geometry('1250x600');win.transient(self)
-        self.label(win,'批内：同Run三复管；批间：手动验证批次内，当前Run均值与Baseline均值两个数的CV。所有数值指标自动计算，超限标红，不拦截导出。')
-        tree=self.tree(win,VALIDATION_CV_HEADERS,[110,160,140,140,140,140,180,70,85,85,240,120,200])
-        for row in rows:
-            shown=list(row);shown[8]='' if row[8] is None else f'{row[8]:.2f}'
-            tree.insert('','end',values=shown,tags=('error',) if row[10]!='达标' else ())
-        self.button(win,'关闭',win.destroy,side='bottom')
+        args=self.validation_inputs()
+        def done(result):
+            items,rows=result
+            win=tk.Toplevel(self);win.title('验证CV（Control不参与）');win.geometry('1250x600');win.transient(self)
+            self.label(win,'批内：同Run三复管；批间：当前Run均值与Baseline均值两个数的CV。全部数值指标自动计算；超限标红，不拦截导出。')
+            tree=self.tree(win,VALIDATION_CV_HEADERS,[110,160,140,140,140,140,180,70,85,85,240,120,200])
+            shown=[]
+            for i,row in enumerate(rows):
+                values=list(row);values[8]='' if row[8] is None else f'{row[8]:.2f}'
+                shown.append(dict(iid=str(i),values=values,tags=('error',) if row[10]!='达标' else ()))
+            PagedTable(self,tree).set_rows(shown,{},None)
+        self.run_job('计算验证CV',lambda store:store.validation_report(*args),done,refresh=False)
 
     def validation_export_ui(self):
         args=self.validation_inputs()
-        # Archive is allowed even when no sample/metric is selected for CV.
         path=filedialog.asksaveasfilename(title='验证汇总＋所有管留档',initialfile=self.project_box.get()+'_'+self.panel_box.get()+'_验证.xlsx',defaultextension='.xlsx',filetypes=[('Excel','*.xlsx')],parent=self)
         if path:
-            n=self.store.export_validation(*args,path);self.status.set(f'全部验证管已留档，CV结果{n}项：'+path)
+            self.run_job('导出验证报告',lambda store:store.export_validation(*args,path),
+                         lambda n:self.status.set(f'全部验证管已留档，CV结果{n}项：'+path),refresh=False)
 
     def enable_sorting(self,tree,default=0):
         names=[tree.heading(c,'text') for c in tree['columns']]
@@ -3695,6 +3787,10 @@ class App(tk.Tk):
         if column is None:column,descending=old
         elif descending is None:descending=not old[1] if old[0]==column else False
         tree.sort_state=(column,descending)
+        if hasattr(tree,'page_view'):
+            view=tree.page_view;view.page=0;view.sort_rows();view.render()
+            for i,name in enumerate(tree.sort_names):tree.heading(str(i),text=name+(' ↓' if descending else ' ↑') if i==column else name)
+            return
         items=list(tree.get_children());filled=[];empty=[]
         for iid in items:
             value=tree.set(iid,str(column))
@@ -3747,8 +3843,7 @@ class App(tk.Tk):
             ('受试者库','受试者库','导入、核对和修正样品资料。'),
             ('重分析审核','重分析审核','比较不同分析版本，保留选择依据。'),
             ('导入字段配置','导入字段配置','对应不同导出模板的基础信息列。'),
-            ('一致性核查','一致性核查','按BAS ID比较两份Excel的指定Sheet。'),
-            ('历史与记录','历史记录','查看来源、历史版本和操作记录。')]
+            ('一致性核查','一致性核查','按BAS ID比较两份Excel的指定Sheet。')]
         self.tabs={};self.nav_buttons={};self.page_titles={}
         for name,label,subtitle in pages:
             frame=ttk.Frame(self.notebook);self.notebook.add(frame,text=label);self.tabs[name]=frame
@@ -3766,12 +3861,17 @@ class App(tk.Tk):
         for i,(key,title,detail,style) in enumerate([
             ('current','当前有效','当前 Panel 的结果','Stat.TLabel'),
             ('pending','待审核','需要确认的分析版本','StatWarn.TLabel'),
-            ('issues','导入异常','项目范围的未纳入文件','StatError.TLabel'),
+            ('issues','数据异常','点击筛选资料冲突或Beads待确认的记录','StatError.TLabel'),
+            ('imports','导入异常','点击查看项目范围的问题文件','StatError.TLabel'),
             ('summary','Summary','当前 Panel 的导出状态','StatText.TLabel')]):
             cards.columnconfigure(i,weight=1,uniform='status')
             card=ttk.Frame(cards,padding=(10,8)); card.grid(row=0,column=i,sticky='nsew')
             ttk.Label(card,text=title,style='Muted.TLabel').pack(anchor='w')
             value=ctk.CTkLabel(card,text='—',height=28,font=(self.ui_font,21),text_color={'pending':'#9B6B00','issues':'#C83C35'}.get(key,'#1D1D1F'),anchor='w'); value.pack(fill='x',pady=(2,0)); self.stat_labels[key]=value
+            if key in ('issues','imports'):
+                callback=self.filter_data_issues if key=='issues' else self.show_import_issues
+                value.configure(cursor='hand2')
+                value.bind('<Button-1>',lambda e,fn=callback:self.guard(fn))
         ttk.Separator(t,orient='horizontal',style='Mac.TSeparator').pack(fill='x',padx=12,pady=(0,8))
         self.add_header_actions('数据与导出',[
             ('补充文件',self.select_files,'TButton'),
@@ -3783,11 +3883,14 @@ class App(tk.Tk):
         self.button(row,'复管 CV',self.preview_cv)
         self.button(row,'导出 Summary',self.export_dialog,style='Primary.TButton')
         self.exclude_fail=tk.BooleanVar(value=False)
-        ttk.Checkbutton(row,text='Summary 排除F（保留历史）',variable=self.exclude_fail).pack(side='right',padx=8)
+        ttk.Checkbutton(row,text='Summary 排除F（保留历史）',variable=self.exclude_fail,command=self.update_summary_status).pack(side='right',padx=8)
+        self.summary_detail=ttk.Label(lower,text='',style='Muted.TLabel')
+        self.summary_detail.pack(anchor='w',padx=8,pady=(4,0))
         caption=ttk.Frame(t); caption.pack(fill='x',padx=14,pady=(3,0))
         ttk.Label(caption,text='检测结果',style='Section.TLabel').pack(side='left')
         self.count_label=ttk.Label(caption,text='双击单元格修改／查看检测数据',style='Muted.TLabel'); self.count_label.pack(side='right')
         self.data_tree=self.tree(t,['ID','P/F ▾','BAS ID','Subject ID','Cycle（给药）','Visit','Timepoint','Tube','Run','Date','Time','Beads','血量µL'],[65,75,145,100,110,70,150,150,80,110,95,95,85])
+        PagedTable(self,self.data_tree,run_column=8)
         self.enable_sorting(self.data_tree,2)
         self.data_tree.red_edit=lambda row,col:self.guard(lambda:self.edit_record_dialog(int(row),{3:'Subject ID',4:'Cycle',5:'Visit',6:'Timepoint'}.get(col))) if col!=11 else self.guard(lambda:self.open_beads_record(int(row)))
         self.data_tree.bind('<ButtonRelease-1>',lambda e:self.guard(lambda:self.open_pf_dropdown(e)))
@@ -3831,17 +3934,10 @@ class App(tk.Tk):
             ('待修正清单',self.show_subject_import_issues,'TButton'),
             ('不采用选中行',self.dismiss_subject_issue,'TButton')])
         self.subject_tree = self.tree(t, [SUBJECT_SPLIT_LABELS.get(h,h) for h in SUBJECT_SPLIT_VIEW]+['状态','问题说明'], [145,155,110,130,110,145,110,110,140,140,100,420])
+        PagedTable(self,self.subject_tree)
         self.enable_sorting(self.subject_tree,0)
         self.subject_tree.red_edit=lambda row,col:(self.subject_tree.selection_set(row),self.guard(self.subject_dialog))
         self.subject_tree.bind('<Double-1>',lambda _:self.guard(self.subject_dialog))
-        t = self.tabs['历史与记录']
-        self.label(t, '历史结果不会删除。“已被替代”与“Fail”分别保存；导出Excel包含历史、来源及操作记录。')
-        bar = ttk.Frame(t); bar.pack(fill='x',padx=8)
-        self.button(bar, '查看历史记录详情', lambda: self.review_selected(self.history_tree))
-        self.button(bar, '设置历史记录P/F', lambda: self.pf_dialog(self.history_tree))
-        self.button(bar, '查看项目操作日志', self.audit_dialog)
-        self.button(bar, '查看最近导入清单', self.last_import_dialog)
-        self.history_tree = self.tree(t, ['ID','状态','P/F','BAS ID','Tube','Run','Beads','血量µL','替代ID','原因'], [70,120,55,145,155,80,100,90,90,320])
         self.schedule_header_layout()
 
     def require_panel(self):
@@ -3983,14 +4079,17 @@ class App(tk.Tk):
 
     def refresh(self):
         self.close_pf_dropdown()
-        for tree in [self.data_tree,self.pending_tree,self.bead_tree,self.subject_tree,self.history_tree,self.validation_tree]:
+        for tree in [self.pending_tree,self.bead_tree,self.validation_tree]:
             tree.set_red_cells({})
             tree.delete(*tree.get_children())
         if not self.panel_id:
+            for tree in (self.data_tree,self.subject_tree):tree.page_view.set_rows([],{},None)
+            self.summary_detail.configure(text="")
             for label in self.stat_labels.values(): label.configure(text='—')
             self.count_label.configure(text='')
             self.empty_hint.place(relx=.5,rely=.5,anchor='center'); return
-        records = self.store.records(self.panel_id)
+        records = self.store.records(self.panel_id,["current","pending"])
+        data_rows=[];subject_rows=[]
         conflicts=self.store.metadata_conflicts(self.pid);red_cells={};subject_conflicts={}
         reviews=self.store.beads_reviews(self.panel_id)
         for record in records:
@@ -4002,15 +4101,14 @@ class App(tk.Tk):
             payload = json.loads(r['payload']); m = dict(payload['meta']); ident = str(r['id'])
             if m.get('BAS ID'):counts[r['state']] += 1
             if payload.get('sample_kind') == 'validation': m['BAS ID'] = '验证：'+sample_display(payload)
-            self.history_tree.insert('', 'end', iid=ident, values=[r['id'],STATE_LABEL[r['state']],r['pf'],m['BAS ID'],m['Tube'],m['Run number'],r['beads'] or '',r['volume'] or '',r['supersedes'] or '',r['reason']])
             if r['state'] == 'current' and payload['meta'].get('BAS ID'):
                 for field in conflicts.get(r['id'],{}):
                     if field in ('Subject ID','Cycle','Visit','Timepoint'):red_cells[(ident,{'Subject ID':3,'Cycle':4,'Visit':5,'Timepoint':6}[field])]='待修正，暂不纳入有效汇报'
                 if m['Run number'] and run_number(m['Run number']) in reviews:red_cells[(ident,11)]='样品名Beads待确认'
-                self.data_tree.insert('', 'end', iid=ident, tags=('error',) if r['pf']=='F' else (), values=[r['id'],(r['pf'] or '—')+' ▾'] + [m[h] for h in ['BAS ID','Subject ID','Cycle','Visit','Timepoint','Tube','Run number','Date','Time']] + [r['beads'] or '',r['volume'] or ''])
+                data_rows.append(dict(iid=ident, tags=('error',) if r['pf']=='F' else (), values=[r['id'],(r['pf'] or '—')+' ▾'] + [m[h] for h in ['BAS ID','Subject ID','Cycle','Visit','Timepoint','Tube','Run number','Date','Time']] + [r['beads'] or '',r['volume'] or '']))
             if r['state'] == 'pending':
                 self.pending_tree.insert('', 'end', iid=ident, tags=('warning',), values=[r['id']] + [m[h] for h in ['BAS ID','Subject ID','Cycle','Visit','Timepoint','Tube','Run number','Date','Time']])
-        self.data_tree.set_red_cells(red_cells)
+        self.data_tree.page_view.set_rows(data_rows,red_cells,(str(self.store.path),self.panel_id))
         parameters={r['run']:r for r in self.store.parameters(self.panel_id)};bead_red={}
         for run in sorted(set(parameters)|set(reviews)):
             r=parameters.get(run);review=reviews.get(run)
@@ -4030,55 +4128,88 @@ class App(tk.Tk):
             fields=subject_conflicts.get(s['样品编号'],set())
             for field in fields:
                 for col in {'Subject ID':[2],'Cycle':[3],'Visit':[4],'Timepoint':[5,6,7]}.get(field,[]):subject_red[(s['样品编号'],col)]='与检测数据不一致'
-            self.subject_tree.insert('', 'end', iid=s['样品编号'], values=[split.get(h,'') for h in SUBJECT_SPLIT_VIEW]+['待核对' if fields else '有效','与检测数据不一致：'+', '.join(sorted(fields)) if fields else ''])
+            subject_rows.append(dict(iid=s['样品编号'], values=[split.get(h,'') for h in SUBJECT_SPLIT_VIEW]+['待核对' if fields else '有效','与检测数据不一致：'+', '.join(sorted(fields)) if fields else '']))
         for issue in self.store.subject_import_issues(self.pid):
             data=split_subject(issue['row'])
-            self.subject_tree.insert('','end',iid=f'issue:{issue["audit_id"]}:{issue["index"]}',values=[txt(data.get(h)) for h in SUBJECT_SPLIT_VIEW]+['待修正',f'{Path(issue["file"]).name} / {issue["sheet"]} / 行{issue["line"]}：'+issue['detail']],tags=('error',))
-        self.subject_tree.set_red_cells(subject_red)
-        self.sort_table(self.data_tree);self.sort_table(self.subject_tree)
+            subject_rows.append(dict(iid=f'issue:{issue["audit_id"]}:{issue["index"]}',values=[txt(data.get(h)) for h in SUBJECT_SPLIT_VIEW]+['待修正',f'{Path(issue["file"]).name} / {issue["sheet"]} / 行{issue["line"]}：'+issue['detail']],tags=('error',)))
+        self.subject_tree.page_view.set_rows(subject_rows,subject_red,(str(self.store.path),self.pid))
         self.count_label.configure(text=f'{self.panel_box.get()} · {counts["current"]} 条正式记录 · 红色资料待修正后方可汇报 · 双击修改')
         self.stat_labels['current'].configure(text=str(counts['current']))
         self.stat_labels['pending'].configure(text=str(counts['pending']))
-        self.stat_labels['issues'].configure(text=str(len(self.store.unresolved_imports(self.pid))))
+        self.stat_labels['issues'].configure(text=str(len({iid for iid,col in red_cells})))
+        self.stat_labels['imports'].configure(text=str(len(self.store.unresolved_imports(self.pid))))
         if counts['current']: self.empty_hint.place_forget()
         else:
             self.empty_hint.configure(text='当前没有有效结果\n'+('请先处理待审核的分析版本' if counts['pending'] else '点击“导入文件夹”开始导入'))
             self.empty_hint.place(relx=.5,rely=.5,anchor='center')
-        summary=self.store.summary_status(self.panel_id)
-        self.stat_labels['summary'].configure(text='已导出' if summary['ready'] else '待导出')
-        available_fields = self.store.available_fields(self.panel_id, _records=records)
+        self.update_summary_status()
+        available_fields = self.store.available_fields(self.panel_id)
         self.source_box['values'] = available_fields
         self.bead_field_box['values'] = available_fields
         self.path_label.configure(text='数据库：' + str(self.store.path))
 
-    def run_job(self, title, job, done):
+
+    def filter_data_issues(self):
+        self.require_panel();self.open_section('数据与导出')
+        self.data_tree.page_view.show_issues()
+        self.status.set('仅显示资料冲突或Beads待确认的记录；点击“显示全部”恢复。筛选不改变Summary导出范围。')
+
+    def show_import_issues(self):
+        self.require_panel();rows=self.store.unresolved_imports(self.pid)
+        win=tk.Toplevel(self);win.title('项目导入异常');win.geometry('1100x600');win.transient(self)
+        self.label(win,f'共 {len(rows)} 个问题文件；这些文件问题不等同于工作台中的数据异常。')
+        tree=self.tree(win,['状态','文件','原因'],[90,450,480])
+        for r in rows:tree.insert('','end',values=[r['status'],r['file'],r['detail']])
+        self.button(win,'查看最近导入清单',self.last_import_dialog)
+
+    def update_summary_status(self):
+        if not self.panel_id:return
+        summary=self.store.summary_status(self.panel_id,self.exclude_fail.get())
+        self.stat_labels['summary'].configure(text='已导出' if summary['ready'] else '待导出')
+        if not summary.get('stamp'):
+            self.summary_detail.configure(text='尚未导出。搜索和分页仅影响查看，Summary导出完整范围。');return
+        stamp=datetime.fromisoformat(summary['stamp']).astimezone().strftime('%Y-%m-%d %H:%M')
+        scope='排除F' if summary['exclude_fail'] else '包含F'
+        state='与当前数据及导出条件一致' if summary['ready'] else '数据或导出条件已变化，请重新导出'
+        self.summary_detail.configure(text=f'上次导出：{stamp} · {scope} · {summary["rows"]} 条 · {state}')
+
+    def run_job(self, title, job, done, refresh=True):
         """All Tk operations stay on the main thread; worker opens its own SQLite connection."""
         dialog = tk.Toplevel(self); dialog.title(title); dialog.geometry('440x140'); dialog.transient(self); dialog.grab_set()
         ttk.Label(dialog,text=title,style='Section.TLabel').pack(pady=(20,4))
-        ttk.Label(dialog,text='正在处理，请稍候…',style='Muted.TLabel').pack(pady=(0,12))
+        detail=ttk.Label(dialog,text='正在处理，请稍候…',style='Muted.TLabel');detail.pack(pady=(0,12))
         progress = ttk.Progressbar(dialog, mode='indeterminate'); progress.pack(fill='x',padx=25); progress.start()
         dialog.protocol('WM_DELETE_WINDOW', lambda: None)
         q = queue.Queue(); path = self.store.path
         def work():
             store = None
             try:
-                store = Store(path); q.put((True, job(store)))
+                store = Store(path)
+                store.progress=lambda message:q.put(('progress',message))
+                result=job(store)
+                store.close();store=None
+                q.put((True, result))
             except Exception as exc:
                 q.put((False, str(exc)))
             finally:
                 if store: store.close()
         threading.Thread(target=work, daemon=True).start()
         def poll():
+            latest=None
             try:
-                ok, result = q.get_nowait()
+                while True:
+                    ok, result = q.get_nowait()
+                    if ok!='progress':break
+                    latest=result
             except queue.Empty:
+                if latest is not None:detail.configure(text=latest)
                 self.after(100, poll); return
             progress.stop(); dialog.grab_release(); dialog.destroy()
             if ok:
                 self.guard(lambda: done(result))
             else:
                 messagebox.showerror('未完成操作', result, parent=self)
-            self.refresh()
+            if refresh:self.refresh()
         self.after(100, poll)
 
     def select_files(self):
@@ -4775,7 +4906,8 @@ class App(tk.Tk):
                 if current['state']!='current': raise ValueError('记录状态已变化，请刷新后再修改')
                 if current['pf']!=pf:self.store.set_pf(int(row),pf,'数据工作台P/F下拉选择')
             finally: self.close_pf_dropdown()
-            self.refresh();self.data_tree.selection_set(row);self.data_tree.see(row)
+            self.refresh()
+            if self.data_tree.exists(row):self.data_tree.selection_set(row);self.data_tree.see(row)
         editor.bind('<<ComboboxSelected>>',lambda e:self.guard(lambda:commit(e)))
         editor.bind('<Escape>',lambda e:self.close_pf_dropdown())
 
@@ -4982,32 +5114,43 @@ class App(tk.Tk):
         if self.config_dirty:
             if not messagebox.askyesno('保存配置','先保存当前汇报项配置再预览？',parent=self):return
             self.save_config_ui()
-        prepared=self.store.prepare_report(panel,self.exclude_fail.get(),_check_pending=False,_allow_partial=True)
-        cfg=self.store.config(panel)
-        win=tk.Toplevel(self);win.title('报告预览（前200条）');win.geometry('1200x640');win.transient(self)
-        self.label(win,f'符合条件共{len(prepared)}条。ABS单位为cells/µL，预览按已保存的汇报精度显示；ABS与CV仍使用未舍入数据计算。')
-        self.label(win,'正式样品导出到Summary；验证样品单独导出原始指标，不含ABS。缺失项留空，原因写入“汇总问题”；待审核候选不自动采用。')
-        table=self.tree(win,['输出工作表','验证样品名称']+META+[c['name'] for c in cfg['columns']])
-        for rec,p,values,calc,_ in prepared[:200]:
-            display=[]
-            for c,v in zip(cfg['columns'],values):
-                if isinstance(v,tuple):v=calc[v[1]][6]
-                display.append(formatted_report_value(v,c))
-            table.insert('','end',values=['验证样品' if p.get('sample_kind')=='validation' else 'Summary',p.get('sample_name','')]+[rec['pf'] if h=='P/F' else p['meta'][h] for h in META]+display)
+        exclude=self.exclude_fail.get()
+        def work(store):
+            cfg=store.config(panel)
+            prepared=store.prepare_report(panel,exclude,_check_pending=False,_allow_partial=True)
+            rows=[]
+            for rec,p,values,calc,_ in prepared:
+                display=[]
+                for c,v in zip(cfg['columns'],values):
+                    if isinstance(v,tuple):v=calc[v[1]][6]
+                    display.append(formatted_report_value(v,c))
+                rows.append(dict(iid=str(rec['id']),values=['验证样品' if p.get('sample_kind')=='validation' else 'Summary',p.get('sample_name','')]+[rec['pf'] if h=='P/F' else p['meta'][h] for h in META]+display))
+            return cfg,rows
+        def done(result):
+            cfg,rows=result
+            win=tk.Toplevel(self);win.title('报告预览');win.geometry('1200x640');win.transient(self)
+            self.label(win,f'符合条件共{len(rows)}条，分页查看。ABS单位为cells/µL；按已保存的汇报精度显示，计算使用未舍入数据。')
+            self.label(win,'搜索仅影响预览；缺失项留空，原因见导出报告的待处理问题。待审核候选不自动采用。')
+            table=self.tree(win,['输出工作表','验证样品名称']+META+[c['name'] for c in cfg['columns']])
+            PagedTable(self,table,run_column=2+META.index('Run number')).set_rows(rows,{},None)
+        self.run_job('准备报告预览',work,done,refresh=False)
 
     def preview_cv(self):
         panel=self.require_panel()
         if self.config_dirty:
             if not messagebox.askyesno('保存配置','先保存当前配置再计算CV？',parent=self):return
             self.save_config_ui()
-        cfg=self.store.config(panel)
-        rows=replicate_cv_rows(self.store.prepare_report(panel,False,_check_pending=False,_allow_partial=True),cfg,self.panel_box.get(),_allow_partial=True)
-        win=tk.Toplevel(self);win.title('同Run复管CV');win.geometry('1200x650');win.transient(self)
-        self.label(win,'CV = 样本SD(n−1) / 均值 × 100%。包括当前F复管；阈值判断不自动改变P/F。')
-        if not rows:self.label(win,'没有rpt复管数据，或未启用CV计算。')
-        table=self.tree(win,CV_HEADERS)
-        for row in rows:
-            table.insert('','end',values=['' if v is None else (f'{v:.3f}' if isinstance(v,float) else v) for v in row])
+        panel_name=self.panel_box.get()
+        def work(store):
+            return replicate_cv_rows(store.prepare_report(panel,False,_check_pending=False,_allow_partial=True),store.config(panel),panel_name,_allow_partial=True)
+        def done(rows):
+            win=tk.Toplevel(self);win.title('同Run复管CV');win.geometry('1200x650');win.transient(self)
+            self.label(win,'CV = 样本SD(n−1) / 均值 × 100%。包括当前F复管；阈值判断不自动改变P/F。')
+            if not rows:self.label(win,'没有rpt复管数据，或未启用CV计算。')
+            table=self.tree(win,CV_HEADERS)
+            shown=[dict(iid=str(i),values=['' if v is None else (f'{v:.3f}' if isinstance(v,float) else v) for v in row]) for i,row in enumerate(rows)]
+            PagedTable(self,table).set_rows(shown,{},None)
+        self.run_job('计算复管CV',work,done,refresh=False)
 
     def export_dialog(self):
         panel=self.require_panel()
