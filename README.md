@@ -1,3 +1,7 @@
+## V3.4.5
+
+Summary数值页 + Summary公式页；新增独立Summary CV小数位设置。公式与结果基于未舍入数据，缺失结果不填0。
+
 # Express7 CytoSummary
 
 **Express7 数据汇总 · Flow Cytometry Data Summary**

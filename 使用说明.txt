@@ -1,3 +1,10 @@
+V3.4.5 更新
+Summary全部写入数值，ABS、Average、CV无需Excel重算即可读取。
+新增第二页Summary公式，保留相同布局及真实Excel公式；公式引用未舍入计算明细。
+汇报项配置新增独立Summary CV小数位，旧配置默认保留两位；指标精度仍逐项设置。
+缺失ABS仍留空，原因见待处理问题；不会填0。公式页仍需Excel计算。
+数据库及依赖不变，原配置兼容。
+
 Express7 CytoSummary 流式数据汇总工具 V3.4.4
 作者 Guibin Huang
 

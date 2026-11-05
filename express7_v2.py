@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.4.4'
+VERSION = '3.4.5'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -469,16 +469,44 @@ def inline_sample_statistics(wb,cfg,prepared,exclude_fail):
                     pct=column['kind']=='pct1' and column['mode']=='raw';scaled=Decimal(str(mean))*(100 if pct else 1);digits=column['precision_digits']
                     rounding=digits if pm=='decimals' else (digits-1-scaled.copy_abs().adjusted() if scaled else digits-1)
                     formula=f'ROUND(({formula})*100,{rounding})/100' if pct else f'ROUND({formula},{rounding})'
-                ac.value='='+formula;ac.comment=Comment(rule+f'\n未舍入均值：{mean}','流式数据汇总工具')
-                cc.number_format='0.00'
+                ac.value='='+formula
+                wb._summary_results[ac.value]=float(rendered.rstrip('%'))/(100 if suffix else 1) if pm!='default' else mean
+                ac.comment=Comment(rule+f'\n未舍入均值：{mean}','流式数据汇总工具')
+                cc.number_format='0'+('.'+'0'*cfg.get('cv_digits',2) if cfg.get('cv_digits',2) else '')
                 if len(numbers)<2:reason='不足2管，CV留空'
                 elif mean<=0:reason='均值≤0，CV未定义，留空'
                 else:
                     args=','.join(refs);cc.value=f'=STDEV({args})/AVERAGE({args})*100'
-                cc.comment=Comment(rule+'\n'+(reason or '样本SD(n−1) / 未舍入均值 × 100%；显示两位小数。'),'流式数据汇总工具')
+                    wb._summary_results[cc.value]=statistics.stdev(numbers)/mean*100
+                cc.comment=Comment(rule+'\n'+(reason or '样本SD(n−1) / 未舍入均值 × 100%；显示精度按独立CV小数位设置。'),'流式数据汇总工具')
     wb.remove(old);ws.title='Summary';ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
     for ci in range(21,27):calcws.column_dimensions[get_column_letter(ci)].width=23
     literal_row(wb['_V2说明'],['样本统计','各BAS/Run全部管后追加Average/CV%；仅rpt/Sample样本管；两套命名组分别计算。统计输入见计算明细U:Z；单管或均值≤0的CV留空。'])
+
+
+def capture_summary_results(wb,cfg,prepared):
+    wb._summary_results={}
+    ws=wb['Summary'];heads=[c.value for c in ws[1]];idcol=heads.index('记录ID')+1
+    by_id={r['id']:(vals,calc) for r,p,vals,calc,ok in prepared}
+    for row in ws.iter_rows(min_row=2):
+        vals,calc=by_id[row[idcol-1].value]
+        for i,col in enumerate(cfg['columns']):
+            cell=row[len(META)+i]
+            if cell.data_type!='f':continue
+            v=vals[i];v=calc[v[1]][6] if isinstance(v,tuple) else v
+            if col.get('precision_mode','default')!='default':
+                v=float(formatted_report_value(v,col).rstrip('%'))/(100 if col['mode']=='raw' and col['kind']=='pct1' else 1)
+            wb._summary_results[cell.value]=v
+
+
+def materialize_summary(wb):
+    ws=wb['Summary'];formulas=wb.copy_worksheet(ws);formulas.title='Summary公式'
+    wb.move_sheet(formulas,offset=1-wb.index(formulas))
+    for row in ws:
+        for cell in row:
+            if cell.data_type=='f':
+                if cell.value not in wb._summary_results:raise ValueError('Summary公式缺少已计算结果：'+cell.coordinate)
+                cell.value=wb._summary_results[cell.value]
 
 
 def apply_summary_precision(wb,cfg,prepared):
@@ -513,6 +541,7 @@ def apply_summary_precision(wb,cfg,prepared):
 
 
 def validate_config(cfg):
+    if type(cfg.get('cv_digits',2)) is not int or not 0<=cfg.get('cv_digits',2)<=10:raise ValueError('CV小数位支持0–10位')
     validate_import_options(cfg.get('import_options', {}))
     if not cfg.get('columns'):
         raise ValueError('请至少添加一个汇报项')
@@ -2999,8 +3028,10 @@ class Store:
         note.column_dimensions['B'].width = 95
         compact_qc_summary(self,wb,panel,prepared,exported_ids,cfg,exclude_fail,cv_prepared)
         apply_summary_precision(wb,cfg,prepared)
+        capture_summary_results(wb,cfg,prepared)
         if cfg.get('replicate_cv',True):inline_sample_statistics(wb,cfg,prepared,exclude_fail)
         split_summary_visits(wb['Summary'])
+        materialize_summary(wb)
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -4610,6 +4641,7 @@ class App(tk.Tk):
         ttk.Label(f,text='参与ABS回算的管名').grid(row=0,column=2,padx=5)
         self.regex_var = tk.StringVar(); ttk.Entry(f,textvariable=self.regex_var,width=30).grid(row=0,column=3,padx=8)
         self.cv_enabled_var = tk.BooleanVar(value=True); self.cv_threshold_var = tk.StringVar()
+        self.cv_digits_var=tk.StringVar(value='2')
         self.cv_low_boundary_var=tk.StringVar();self.cv_low_threshold_var=tk.StringVar()
         low=ttk.Frame(f);low.grid(row=1,column=0,columnspan=4,sticky='w',pady=(16,0))
         ttk.Checkbutton(low,text='rpt复管CV',variable=self.cv_enabled_var).pack(side='left',padx=(0,18))
@@ -4621,6 +4653,10 @@ class App(tk.Tk):
         ttk.Label(low,text='% 时，CV ≤').pack(side='left',padx=5)
         ttk.Entry(low,textvariable=self.cv_low_threshold_var,width=6).pack(side='left',padx=4)
         ttk.Label(low,text='%').pack(side='left',padx=5)
+        precision_row=ttk.Frame(f);precision_row.grid(row=2,column=0,columnspan=4,sticky='w',pady=(12,0))
+        ttk.Label(precision_row,text='Summary CV小数位（独立于指标）').pack(side='left')
+        ttk.Spinbox(precision_row,from_=0,to=10,textvariable=self.cv_digits_var,width=5).pack(side='left',padx=8)
+        self.cv_digits_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.cv_low_boundary_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.cv_low_threshold_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.bead_field_var.trace_add('write',lambda *_:self.mark_config_dirty())
@@ -4673,6 +4709,7 @@ class App(tk.Tk):
         else: self.abs_form.pack_forget()
 
     def load_tube_names(self,cfg):
+        self.cv_digits_var.set(str(cfg.get('cv_digits',2)))
         display=tube_names_display(cfg)
         self.regex_var.set(display);self._tube_names_loaded=display
         if hasattr(self,'cv_low_boundary_var'):
@@ -4830,6 +4867,8 @@ class App(tk.Tk):
         old_names=tube_names_display(self.cfg)
         if 'abs_tube_names' in cfg or names!=getattr(self,'_tube_names_loaded','') or old_names:
             cfg['abs_tube_names']=names;cfg['sample_regex']=tube_names_regex(names)
+        cfg['cv_digits']=int(self.cv_digits_var.get())
+        if not 0<=cfg['cv_digits']<=10:raise ValueError('CV小数位支持0–10位')
         cfg['replicate_cv']=self.cv_enabled_var.get()
         cfg['cv_threshold']=numeric(self.cv_threshold_var.get(),'CV阈值') if txt(self.cv_threshold_var.get()) else None
         cfg['cv_low_pct_boundary']=numeric(self.cv_low_boundary_var.get(),'低表达%parent界限','pct100') if txt(self.cv_low_boundary_var.get()) else None
