@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.4.5'
+VERSION = '3.4.6'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -4635,7 +4635,10 @@ class App(tk.Tk):
             ('从Excel读取汇报项',self.generate_config_from_excel,'TButton')])
         self.config_save_status=tk.StringVar(value='尚未选择Panel')
         ttk.Label(t,textvariable=self.config_save_status,style='Muted.TLabel').pack(anchor='e',padx=18,pady=(4,12))
-        f = ttk.Frame(t); f.pack(fill='x',padx=16,pady=(0,14))
+        pages=ttk.Notebook(t);pages.pack(fill='both',expand=True,padx=16,pady=(0,12))
+        metrics=ttk.Frame(pages,padding=8);settings=ttk.Frame(pages,padding=12)
+        pages.add(metrics,text='汇报指标');pages.add(settings,text='ABS / CV 设置')
+        f = ttk.LabelFrame(settings,text='本Panel ABS参数',padding=12); f.pack(fill='x',pady=(0,16))
         ttk.Label(f,text='本Panel Beads Events列').grid(row=0,column=0,padx=5,sticky='w')
         self.bead_field_var = tk.StringVar(); self.bead_field_box = ttk.Combobox(f,textvariable=self.bead_field_var,width=26); self.bead_field_box.grid(row=0,column=1,padx=8)
         ttk.Label(f,text='参与ABS回算的管名').grid(row=0,column=2,padx=5)
@@ -4643,7 +4646,8 @@ class App(tk.Tk):
         self.cv_enabled_var = tk.BooleanVar(value=True); self.cv_threshold_var = tk.StringVar()
         self.cv_digits_var=tk.StringVar(value='2')
         self.cv_low_boundary_var=tk.StringVar();self.cv_low_threshold_var=tk.StringVar()
-        low=ttk.Frame(f);low.grid(row=1,column=0,columnspan=4,sticky='w',pady=(16,0))
+        cv=ttk.LabelFrame(settings,text='复管统计与显示',padding=12);cv.pack(fill='x')
+        low=ttk.Frame(cv);low.pack(fill='x')
         ttk.Checkbutton(low,text='rpt复管CV',variable=self.cv_enabled_var).pack(side='left',padx=(0,18))
         ttk.Label(low,text='常规CV ≤').pack(side='left',padx=(0,5))
         ttk.Entry(low,textvariable=self.cv_threshold_var,width=6).pack(side='left',padx=4)
@@ -4653,7 +4657,7 @@ class App(tk.Tk):
         ttk.Label(low,text='% 时，CV ≤').pack(side='left',padx=5)
         ttk.Entry(low,textvariable=self.cv_low_threshold_var,width=6).pack(side='left',padx=4)
         ttk.Label(low,text='%').pack(side='left',padx=5)
-        precision_row=ttk.Frame(f);precision_row.grid(row=2,column=0,columnspan=4,sticky='w',pady=(12,0))
+        precision_row=ttk.Frame(cv);precision_row.pack(fill='x',pady=(16,0))
         ttk.Label(precision_row,text='Summary CV小数位（独立于指标）').pack(side='left')
         ttk.Spinbox(precision_row,from_=0,to=10,textvariable=self.cv_digits_var,width=5).pack(side='left',padx=8)
         self.cv_digits_var.trace_add('write',lambda *_:self.mark_config_dirty())
@@ -4663,21 +4667,23 @@ class App(tk.Tk):
         self.regex_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.cv_enabled_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.cv_threshold_var.trace_add('write',lambda *_:self.mark_config_dirty())
-        f = ttk.Frame(t); f.pack(fill='x',padx=16,pady=(8,12))
+        t=metrics
+        f = ttk.LabelFrame(t,text='添加汇报指标',padding=10); f.pack(fill='x',pady=(0,10))
+        f.columnconfigure(0,weight=1);f.columnconfigure(1,weight=1)
         self.source_var = tk.StringVar(); self.name_var = tk.StringVar(); self.mode_var = tk.StringVar(value='原始值'); self.kind_var = tk.StringVar(value='数值')
         for i,name in enumerate(['来源表头（可输入）','输出列名','方式','来源类型']): ttk.Label(f,text=name).grid(row=0,column=i,padx=6,pady=(0,6),sticky='w')
-        self.source_box = ttk.Combobox(f,textvariable=self.source_var,width=32); self.source_box.grid(row=1,column=0,padx=6)
+        self.source_box = ttk.Combobox(f,textvariable=self.source_var,width=20); self.source_box.grid(row=1,column=0,padx=6,sticky='ew')
         self.source_box.bind('<<ComboboxSelected>>',lambda e:self.source_selected())
-        ttk.Entry(f,textvariable=self.name_var,width=28).grid(row=1,column=1,padx=6)
+        ttk.Entry(f,textvariable=self.name_var,width=20).grid(row=1,column=1,padx=6,sticky='ew')
         ttk.Combobox(f,textvariable=self.mode_var,values=['原始值','ABS回算'],state='readonly',width=12).grid(row=1,column=2,padx=6)
         ttk.Combobox(f,textvariable=self.kind_var,values=list(KIND_LABEL.values()),state='readonly',width=17).grid(row=1,column=3,padx=6)
         self.precision_mode_var=tk.StringVar(value='默认');self.precision_digits_var=tk.StringVar(value='3')
         precision=ttk.Frame(f);precision.grid(row=2,column=0,columnspan=4,sticky='w',pady=(12,0))
-        ttk.Label(precision,text='Summary精度').pack(side='left',padx=6)
+        ttk.Label(precision,text='该指标精度').pack(side='left',padx=6)
         ttk.Combobox(precision,textvariable=self.precision_mode_var,values=list(PRECISION_LABELS.values()),state='readonly',width=12).pack(side='left',padx=6)
         ttk.Spinbox(precision,from_=0,to=10,textvariable=self.precision_digits_var,width=5).pack(side='left',padx=6)
-        ttk.Label(precision,text='位（默认：Events整数，其余沿用原格式）').pack(side='left',padx=6)
-        f=ttk.Frame(t);self.abs_form=f
+        ttk.Label(precision,text='位 · CV精度在“ABS / CV 设置”中单独设置').pack(side='left',padx=6)
+        f=ttk.LabelFrame(t,text='当前指标的ABS来源',padding=8);self.abs_form=f
         self.parent_var=tk.StringVar(value='本Panel Beads Events');self.parent_rep_var=tk.StringVar(value='唯一一管（多管需指定）');self.parent_confirmed=tk.BooleanVar(value=False)
         ttk.Label(f,text='ABS回算来源').grid(row=0,column=0,padx=6,sticky='w')
         self.parent_box=ttk.Combobox(f,textvariable=self.parent_var,state='readonly',width=34);self.parent_box.grid(row=0,column=1,padx=6)
@@ -4690,12 +4696,13 @@ class App(tk.Tk):
         self.parent_box.bind('<<ComboboxSelected>>',lambda _:self.parent_selected())
         bar = ttk.Frame(t); bar.pack(fill='x',padx=8);self.column_actions=bar
         self.button(bar,'＋ 添加汇报项',self.add_column)
+        self.button(bar,'编辑选中项',self.edit_column)
         self.button(bar,'指定父群来源管',self.parent_choices_dialog)
         self.button(bar,'删除',self.remove_columns,style='Danger.TButton')
         self.button(bar,'↑',lambda:self.move_column(-1))
         self.button(bar,'↓',lambda:self.move_column(1))
         self.button(bar,'清空列表',self.clear_columns,style='Danger.TButton')
-        self.config_tree = self.tree(t,['顺序','输出名称','来源表头','方式','来源类型','精度','ABS回算来源'],[65,200,230,130,130,120,220],height=8)
+        self.config_tree = self.tree(t,['顺序','输出名称','来源表头','方式','来源类型','精度','ABS回算来源'],[50,170,190,100,100,100,170],height=12)
         self.config_tree.bind('<Double-1>',lambda e:self.guard(self.edit_column))
         self.mode_var.trace_add('write',lambda *_:self.show_abs_form())
         self.parent_var.trace_add('write',lambda *_:self.show_abs_form())
