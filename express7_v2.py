@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.4.6'
+VERSION = '3.4.7'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -4702,8 +4702,18 @@ class App(tk.Tk):
         self.button(bar,'↑',lambda:self.move_column(-1))
         self.button(bar,'↓',lambda:self.move_column(1))
         self.button(bar,'清空列表',self.clear_columns,style='Danger.TButton')
+        bulk=ttk.Frame(t);bulk.pack(fill='x',padx=12,pady=(6,0))
+        self.button(bulk,'批量设置小数位',self.batch_precision_dialog)
+        self.config_selection_status=tk.StringVar(value='已选 0 项 · Ctrl多选 / Shift连选 / Ctrl+A全选')
+        ttk.Label(bulk,textvariable=self.config_selection_status,style='Muted.TLabel').pack(side='left',padx=10)
         self.config_tree = self.tree(t,['顺序','输出名称','来源表头','方式','来源类型','精度','ABS回算来源'],[50,170,190,100,100,100,170],height=12)
         self.config_tree.bind('<Double-1>',lambda e:self.guard(self.edit_column))
+        self.config_tree.bind('<<TreeviewSelect>>',lambda _:self.config_selection_status.set(f'已选 {len(self.config_tree.selection())} 项 · Ctrl多选 / Shift连选 / Ctrl+A全选'))
+        def select_all_columns(_):
+            self.config_tree.selection_set(self.config_tree.get_children());return 'break'
+        self.config_tree.bind('<Control-a>',select_all_columns)
+        self.config_tree.bind('<Control-A>',select_all_columns)
+
         self.mode_var.trace_add('write',lambda *_:self.show_abs_form())
         self.parent_var.trace_add('write',lambda *_:self.show_abs_form())
         self.show_abs_form()
@@ -4768,6 +4778,43 @@ class App(tk.Tk):
         self.require_panel(); c = self.column_from_form()
         if norm(c['name']) in list(map(norm,META)) + [norm(x['name']) for x in self.cfg['columns']]: raise ValueError('输出名称重复')
         self.cfg['columns'].append(c); self.mark_config_dirty(); self.render_config()
+
+    def apply_batch_precision(self, selected, digits):
+        options=precision_options('小数位',digits)
+        cfg=json.loads(dumps(self.cfg));changed=0
+        for key in selected:
+            column=cfg['columns'][int(key)]
+            if column['mode']=='raw' and column['kind']=='text':continue
+            column.update(options);changed+=1
+        if not changed:raise ValueError('选中的汇报项均为文本，无需设置小数位')
+        validate_config(cfg)
+        self.cfg=cfg;self.mark_config_dirty();self.render_config()
+        self.config_tree.selection_set(selected)
+        if selected:self.config_tree.see(selected[0])
+        self.status.set(f'已为{changed}个汇报项设置{options["precision_digits"]}位小数；请点击顶部“保存配置”。')
+        return changed
+
+    def batch_precision_dialog(self):
+        self.require_panel();selected=self.config_tree.selection()
+        if not selected:raise ValueError('请先用Ctrl或Shift选择需要修改的汇报项')
+        numeric_count=sum(not (self.cfg['columns'][int(k)]['mode']=='raw' and self.cfg['columns'][int(k)]['kind']=='text') for k in selected)
+        if not numeric_count:raise ValueError('选中的汇报项均为文本，无需设置小数位')
+        win=tk.Toplevel(self);win.title('批量设置小数位');win.transient(self);win.resizable(False,False);win.grab_set()
+        frame=ttk.Frame(win,padding=20);frame.pack(fill='both',expand=True)
+        message=f'应用到选中的 {numeric_count} 个数值指标'
+        if numeric_count<len(selected):message+=f'（跳过 {len(selected)-numeric_count} 个文本项）'
+        ttk.Label(frame,text=message).pack(anchor='w',pady=(0,12))
+        row=ttk.Frame(frame);row.pack(fill='x')
+        ttk.Label(row,text='小数位').pack(side='left')
+        digits=tk.StringVar(value='2')
+        entry=ttk.Spinbox(row,from_=0,to=10,textvariable=digits,width=6);entry.pack(side='left',padx=10)
+        ttk.Label(frame,text='仅修改指标精度；CV小数位保持不变。',style='Muted.TLabel').pack(anchor='w',pady=12)
+        actions=ttk.Frame(frame);actions.pack(fill='x')
+        def apply():
+            self.apply_batch_precision(selected,digits.get());win.destroy()
+        self.button(actions,'应用到选中项',apply,style='Primary.TButton')
+        self.button(actions,'取消',win.destroy)
+        entry.focus_set();entry.selection_range(0,'end')
 
     def edit_column(self):
         selected=self.config_tree.selection()
