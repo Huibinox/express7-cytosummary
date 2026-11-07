@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.4.7'
+VERSION = '3.5.0'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -236,6 +236,8 @@ def join_subject(row):
 
 
 def mode_label(column):
+    if column.get('direct_abs'):return '引用其他Panel ABS'
+    if column.get('abs_reference'):return 'ABS × 百分比'
     return {'raw':'原始值','abs':'Beads回算','parent_abs':'跨Panel ABS×%'}[column['mode']]
 
 
@@ -540,7 +542,63 @@ def apply_summary_precision(wb,cfg,prepared):
     for col in cfg['columns']:literal_row(note,['汇报精度：'+col['name'],precision_label(col)])
 
 
+def method_snapshot(store,pid,name,version):
+    panels=store.panels(pid);names={p['id']:p['name'] for p in panels};items=[]
+    for panel in panels:
+        cfg=store.config(panel['id'])
+        cfg={k:v for k,v in cfg.items() if k in ('columns','beads_field','sample_regex','abs_tube_names','replicate_cv','cv_threshold','cv_digits','cv_low_pct_boundary','cv_low_pct_threshold','import_options')}
+        if 'import_options' in cfg:cfg['import_options'].pop('validation_runs',None)
+        for c in cfg['columns']:
+            c.pop('parent_choices',None)
+            if c['mode']=='parent_abs':
+                if c['parent_panel'] not in names:raise ValueError('ABS来源Panel不存在')
+                c['parent_panel_key']=names[c.pop('parent_panel')]
+        items.append({'name':panel['name'],'config':cfg})
+    return {'format':'express7-method-v1','name':name,'version':version,'panels':items}
+
+
+def create_method_project(store,bundle,name):
+    if bundle.get('format')!='express7-method-v1' or not bundle.get('panels'):raise ValueError('不是有效的方法模板')
+    if not txt(name):raise ValueError('请输入新项目名称')
+    items=bundle['panels'];names=[i['name'] for i in items]
+    if len(set(names))!=len(names):raise ValueError('模板Panel名称重复')
+    store.backup()
+    with store.db:
+        pid=store.db.execute('INSERT INTO projects(name) VALUES(?)',(txt(name),)).lastrowid
+        ids={i['name']:store.db.execute('INSERT INTO panels(project_id,name,config) VALUES(?,?,?)',(pid,i['name'],dumps(empty_config()))).lastrowid for i in items}
+        for item in items:
+            cfg=json.loads(dumps(item['config']))
+            for c in cfg['columns']:
+                c.pop('parent_choices',None)
+                if c['mode']=='parent_abs':
+                    key=c.pop('parent_panel_key')
+                    if key not in ids:raise ValueError('模板缺少来源Panel：'+key)
+                    c['parent_panel']=ids[key];c['parent_panel_name']=key
+            if cfg['columns']:validate_config(cfg)
+            store.db.execute('UPDATE panels SET config=? WHERE id=?',(dumps(cfg),ids[item['name']]))
+        for panel in ids.values():
+            for c in resolve_abs_references(store.config(panel))['columns']:
+                if c['mode']=='parent_abs':store.parent_source_config(panel,c)
+        store.audit(pid,'从方法模板创建项目',{'method':bundle['name'],'version':bundle['version']})
+    return pid
+
+
+def resolve_abs_references(cfg, single=None):
+    result=json.loads(dumps(cfg));by_name={c['name']:c for c in result['columns']}
+    targets=[dict(single)] if single is not None else result['columns']
+    for c in targets:
+        if not c.get('abs_reference'):continue
+        parent=by_name.get(c['abs_reference'])
+        if parent is None or not parent.get('direct_abs'):
+            raise ValueError('引用的ABS不存在：'+c['abs_reference'])
+        for key in ('parent_panel','parent_panel_name','parent_source','parent_replicates','parent_choices'):
+            if key in parent:c[key]=parent[key]
+            else:c.pop(key,None)
+    return targets[0] if single is not None else result
+
+
 def validate_config(cfg):
+    resolve_abs_references(cfg)
     if type(cfg.get('cv_digits',2)) is not int or not 0<=cfg.get('cv_digits',2)<=10:raise ValueError('CV小数位支持0–10位')
     validate_import_options(cfg.get('import_options', {}))
     if not cfg.get('columns'):
@@ -578,7 +636,7 @@ def validate_config(cfg):
             if type(c.get('parent_panel')) is not int or c['parent_panel']<=0 or not txt(c.get('parent_source')):
                 raise ValueError('请选择父群ABS的来源Panel和汇报项')
             if c.get('parent_replicates','unique') not in ('unique','mean'): raise ValueError('父群来源复管规则不支持')
-            if c.get('parent_confirmed') is not True: raise ValueError('请核对百分比的分母确实是选定父群，再勾选确认')
+
             if not isinstance(c.get('parent_choices',{}),dict): raise ValueError('父群取管配置格式错误')
             for key,ids in c.get('parent_choices',{}).items():
                 if not isinstance(key,str) or not isinstance(ids,list) or not ids or any(type(i) is not int or i<=0 for i in ids):
@@ -1851,7 +1909,7 @@ class Store:
     def save_config(self, panel, cfg):
         cfg=strip_retired_config(cfg)
         validate_config(cfg)
-        for column in cfg['columns']:
+        for column in resolve_abs_references(cfg)['columns']:
             if column['mode']=='parent_abs': self.parent_source_config(panel,column)
         self.backup()
         with self.db:
@@ -2707,6 +2765,7 @@ class Store:
         return result
 
     def parent_abs_value(self, panel, column, child, _context=None):
+        column=resolve_abs_references(self.config(panel),column)
         parent,cfg,source=self.parent_source_config(panel,column)
         m=child['meta'];bas=m['BAS ID']
         context = _context if _context is not None else ReportReadContext(self)
@@ -2755,7 +2814,7 @@ class Store:
             'records':lineage,'child_bas':bas,'child_run':m['Run number']}
 
     def prepare_report(self, panel, exclude_fail=False, _rows=None, _cfg=None, _check_pending=True, _allow_partial=False, _context=None):
-        cfg = self.config(panel) if _cfg is None else _cfg
+        cfg = resolve_abs_references(self.config(panel) if _cfg is None else _cfg)
         validate_config(cfg)
         rows = self.records(panel, ['current']) if _rows is None else list(_rows)
         pending = self.records(panel, ['pending'])
@@ -2786,9 +2845,11 @@ class Store:
                     optional = any(header_token(c['source']) in set(map(norm,META_ALIASES[f])) for f in ['Experiment','Date','Time','Analyst'])
                     if c['mode'] == 'raw' and optional and not txt(raw.get(key)):
                         values.append(None); continue
-                    if key not in raw:
+                    if c.get('direct_abs'):
+                        v=100
+                    elif key not in raw:
                         raise ValueError(f'缺少来源表头 {c["source"]}')
-                    v = raw[key]
+                    v = 100 if c.get('direct_abs') else raw[key]
                     if txt(v)=='#' and not (c['mode']=='raw' and c['kind']=='text') and key!=norm(cfg['beads_field']):
                         p.setdefault('hash_originals',{})[key]=v
                     if c['mode'] == 'raw':
@@ -3031,6 +3092,8 @@ class Store:
         capture_summary_results(wb,cfg,prepared)
         if cfg.get('replicate_cv',True):inline_sample_statistics(wb,cfg,prepared,exclude_fail)
         split_summary_visits(wb['Summary'])
+        for i in reversed(range(len(cfg['columns']))):
+            if not cfg['columns'][i].get('enabled',True):wb['Summary'].delete_cols(len(META)+3+i)
         materialize_summary(wb)
         wb.calculation.fullCalcOnLoad = True
         wb.calculation.forceFullCalc = True
@@ -3120,7 +3183,11 @@ def compact_qc_summary(store, wb, panel, prepared, exported_ids, cfg, exclude_fa
             m=p['meta'];n=calc.max_row+1
             literal_row(calc,[rec['id'],line[1],None,None,None,None,line[6],None,m['Run number'],m['BAS ID'],m['Tube'],store.panel(panel)['name'],'跨Panel：'+info['method'],line[2],line[3],line[4],','.join(str(x['record_id']) for x in info['records']),source_text(rec['id']),f"{info['panel']} / {info['source']} × {info['percentage_source']} / 比例除数；百分比分母须为该父群"])
             calc.cell(n,16,'=AVERAGE('+','.join('G'+str(i) for i in parents)+')')
-            calc.cell(n,7,f'=P{n}*N{n}/O{n}');new_rows[key]=n
+            is_reference=any(c['name']==line[1] and c.get('direct_abs') for c in cfg['columns'])
+            calc.cell(n,7,f'=P{n}' if is_reference else f'=P{n}*N{n}/O{n}')
+            if is_reference:
+                calc.cell(n,13,'直接引用其他Panel ABS');calc.cell(n,19,info['panel']+' / '+info['source']+'，直接引用选定父群ABS，不乘百分比')
+            new_rows[key]=n
     formula_map={}
     for key,n in old_direct.items():formula_map["='计算明细'!G"+str(n)]="='计算明细'!G"+str(new_rows[key])
     for key,n in old_parent.items():formula_map["='跨Panel回算'!J"+str(n)]="='计算明细'!G"+str(new_rows[key])
@@ -4668,7 +4735,7 @@ class App(tk.Tk):
         self.cv_enabled_var.trace_add('write',lambda *_:self.mark_config_dirty())
         self.cv_threshold_var.trace_add('write',lambda *_:self.mark_config_dirty())
         t=metrics
-        f = ttk.LabelFrame(t,text='添加汇报指标',padding=10); f.pack(fill='x',pady=(0,10))
+        f = ttk.LabelFrame(t,text='添加汇报指标',padding=10);self.manual_form=f;self.manual_form_open=False
         f.columnconfigure(0,weight=1);f.columnconfigure(1,weight=1)
         self.source_var = tk.StringVar(); self.name_var = tk.StringVar(); self.mode_var = tk.StringVar(value='原始值'); self.kind_var = tk.StringVar(value='数值')
         for i,name in enumerate(['来源表头（可输入）','输出列名','方式','来源类型']): ttk.Label(f,text=name).grid(row=0,column=i,padx=6,pady=(0,6),sticky='w')
@@ -4690,25 +4757,41 @@ class App(tk.Tk):
         ttk.Label(f,text='父群取管规则').grid(row=0,column=2,padx=6)
         ttk.Combobox(f,textvariable=self.parent_rep_var,values=['唯一一管（多管需指定）','同Run rpt复管均值'],state='readonly',width=25).grid(row=0,column=3,padx=6)
         self.parent_check=ttk.Checkbutton(f,text='已核对：百分比的分母与所选父群ABS一致',variable=self.parent_confirmed)
-        self.parent_check.grid(row=1,column=0,columnspan=4,sticky='w',padx=6,pady=6)
+        # Formula relationship is shown directly; no repeated confirmation checkbox.
         def reset_parent_confirmation(*_): self.parent_confirmed.set(False)
         self.source_var.trace_add('write',reset_parent_confirmation);self.parent_var.trace_add('write',reset_parent_confirmation);self.kind_var.trace_add('write',reset_parent_confirmation)
         self.parent_box.bind('<<ComboboxSelected>>',lambda _:self.parent_selected())
         bar = ttk.Frame(t); bar.pack(fill='x',padx=8);self.column_actions=bar
-        self.button(bar,'＋ 添加汇报项',self.add_column)
+        self.button(bar,'添加单个指标',self.toggle_manual_form)
+        submit=ttk.Frame(self.manual_form);submit.grid(row=3,column=0,columnspan=4,sticky='w',pady=6)
+        self.button(submit,'添加到列表',self.add_column)
         self.button(bar,'编辑选中项',self.edit_column)
         self.button(bar,'指定父群来源管',self.parent_choices_dialog)
         self.button(bar,'删除',self.remove_columns,style='Danger.TButton')
-        self.button(bar,'↑',lambda:self.move_column(-1))
-        self.button(bar,'↓',lambda:self.move_column(1))
         self.button(bar,'清空列表',self.clear_columns,style='Danger.TButton')
         bulk=ttk.Frame(t);bulk.pack(fill='x',padx=12,pady=(6,0))
         self.button(bulk,'批量设置小数位',self.batch_precision_dialog)
-        self.config_selection_status=tk.StringVar(value='已选 0 项 · Ctrl多选 / Shift连选 / Ctrl+A全选')
+        self.button(bulk,'汇报 / 暂不汇报',self.toggle_report_columns)
+        self.config_selection_status=tk.StringVar(value='已选 0 项 · Ctrl多选 / Shift连选 / Ctrl+A全选 · 拖动排序')
         ttk.Label(bulk,textvariable=self.config_selection_status,style='Muted.TLabel').pack(side='left',padx=10)
-        self.config_tree = self.tree(t,['顺序','输出名称','来源表头','方式','来源类型','精度','ABS回算来源'],[50,170,190,100,100,100,170],height=12)
-        self.config_tree.bind('<Double-1>',lambda e:self.guard(self.edit_column))
-        self.config_tree.bind('<<TreeviewSelect>>',lambda _:self.config_selection_status.set(f'已选 {len(self.config_tree.selection())} 项 · Ctrl多选 / Shift连选 / Ctrl+A全选'))
+        search=ttk.Frame(t);search.pack(fill='x',padx=12,pady=6)
+        ttk.Label(search,text='搜索指标').pack(side='left')
+        self.column_query=tk.StringVar()
+        ttk.Entry(search,textvariable=self.column_query,width=22).pack(side='left',padx=8)
+        self.button(search,'批量生成ABS',self.bulk_abs_dialog)
+        self.button(search,'引用其他Panel ABS',self.reference_abs_dialog)
+        self.button(search,'方法模板 / 复制',self.method_library_dialog)
+        self.button(search,'检查配置',self.check_method_config)
+        self.config_tree = self.tree(t,['顺序','输出名称（双击修改）','来源表头','方式','来源类型','精度（双击修改）','ABS回算来源','汇报'],[65,150,150,110,90,90,140,65],height=12)
+        self.config_tree.bind('<Double-1>',lambda e:self.guard(lambda:self.edit_report_cell(e)))
+        self.config_tree.bind('<ButtonPress-1>',self.start_column_drag,add='+')
+        self.config_tree.bind('<ButtonRelease-1>',lambda e:self.guard(lambda:self.end_column_drag(e)),add='+')
+        def drag_scroll(event):
+            if event.y<30:self.config_tree.yview_scroll(-1,'units')
+            elif event.y>self.config_tree.winfo_height()-30:self.config_tree.yview_scroll(1,'units')
+        self.config_tree.bind('<B1-Motion>',drag_scroll,add='+')
+        self.column_query.trace_add('write',lambda *_:self.render_config())
+        self.config_tree.bind('<<TreeviewSelect>>',lambda _:self.config_selection_status.set(f'已选 {len(self.config_tree.selection())} 项 · Ctrl多选 / Shift连选 / Ctrl+A全选 · 拖动排序'))
         def select_all_columns(_):
             self.config_tree.selection_set(self.config_tree.get_children());return 'break'
         self.config_tree.bind('<Control-a>',select_all_columns)
@@ -4718,11 +4801,17 @@ class App(tk.Tk):
         self.parent_var.trace_add('write',lambda *_:self.show_abs_form())
         self.show_abs_form()
 
+    def toggle_manual_form(self):
+        self.manual_form_open=not self.manual_form_open
+        if self.manual_form_open:self.manual_form.pack(fill='x',pady=(0,8),before=self.column_actions)
+        else:self.manual_form.pack_forget()
+        self.show_abs_form()
+
     def show_abs_form(self):
-        if self.mode_var.get()=='ABS回算':
+        if self.manual_form_open and self.mode_var.get()=='ABS回算':
             self.abs_form.pack(fill='x',padx=12,pady=6,before=self.column_actions)
             if self.parent_var.get()=='本Panel Beads Events': self.parent_check.grid_remove()
-            else: self.parent_check.grid()
+            else: self.parent_check.grid_remove()
         else: self.abs_form.pack_forget()
 
     def load_tube_names(self,cfg):
@@ -4748,8 +4837,10 @@ class App(tk.Tk):
     def render_config(self):
         self.refresh_parent_options()
         self.config_tree.delete(*self.config_tree.get_children())
+        query=self.column_query.get().strip().casefold()
         for i,c in enumerate(self.cfg['columns']):
-            self.config_tree.insert('','end',iid=str(i),values=[i+1,c['name'],c['source'],mode_label(c),KIND_LABEL[c['kind']],precision_label(c),abs_source_label(c)])
+            if query and query not in (c['name']+' '+c['source']).casefold():continue
+            self.config_tree.insert('','end',iid=str(i),values=[i+1,c['name'],c['source'],mode_label(c),KIND_LABEL[c['kind']],precision_label(c),abs_source_label(c),'是' if c.get('enabled',True) else '否'])
 
     def parent_selected(self):
         self.mode_var.set('ABS回算')
@@ -4769,7 +4860,7 @@ class App(tk.Tk):
             chosen=self.parent_options.get(self.parent_var.get())
             if not chosen: raise ValueError('父群来源项不存在，请先保存计数Panel的ABS配置后重新选择')
             result.update(mode='parent_abs',kind=kind,parent_panel=chosen['panel'],parent_panel_name=chosen['panel_name'],parent_source=chosen['source'],
-                parent_replicates='mean' if self.parent_rep_var.get()=='同Run rpt复管均值' else 'unique',parent_confirmed=self.parent_confirmed.get())
+                parent_replicates='mean' if self.parent_rep_var.get()=='同Run rpt复管均值' else 'unique',parent_confirmed=True)
         result.update(precision_options(self.precision_mode_var.get(),self.precision_digits_var.get()))
         validate_config({**self.cfg,'columns':[result]})
         return result
@@ -4816,10 +4907,188 @@ class App(tk.Tk):
         self.button(actions,'取消',win.destroy)
         entry.focus_set();entry.selection_range(0,'end')
 
+    def toggle_report_columns(self):
+        selected=self.config_tree.selection()
+        if not selected:raise ValueError('请先选择汇报项')
+        enabled=not all(self.cfg['columns'][int(i)].get('enabled',True) for i in selected)
+        for i in selected:self.cfg['columns'][int(i)]['enabled']=enabled
+        self.mark_config_dirty();self.render_config();self.config_tree.selection_set(selected)
+
+    def start_column_drag(self,event):
+        self._column_drag=(self.config_tree.identify_row(event.y),event.y)
+
+    def reorder_report_columns(self,selected,target,after=False):
+        if self.column_query.get().strip():raise ValueError('请先清空搜索，再拖动调整完整列表顺序')
+        ids=sorted(map(int,selected));target=int(target)
+        if target in ids:return
+        moving=[self.cfg['columns'][i] for i in ids]
+        remaining=[c for i,c in enumerate(self.cfg['columns']) if i not in ids]
+        at=target+int(after)-sum(i<target for i in ids)
+        self.cfg['columns']=remaining[:at]+moving+remaining[at:]
+        self.mark_config_dirty();self.render_config();self.config_tree.selection_set(tuple(str(at+i) for i in range(len(moving))))
+
+    def end_column_drag(self,event):
+        start,y=getattr(self,'_column_drag',('',event.y));target=self.config_tree.identify_row(event.y)
+        if start and target and abs(event.y-y)>8:
+            selected=self.config_tree.selection()
+            box=self.config_tree.bbox(target)
+            self.reorder_report_columns(selected if start in selected else (start,),target,event.y>box[1]+box[3]/2)
+
+    def edit_report_cell(self,event):
+        key=self.config_tree.identify_row(event.y);column=self.config_tree.identify_column(event.x)
+        if not key:return
+        if column=='#8':self.config_tree.selection_set(key);self.toggle_report_columns();return
+        if column not in ('#2','#6'):self.edit_column();return
+        c=self.cfg['columns'][int(key)];box=self.config_tree.bbox(key,column)
+        if not box:return
+        value=tk.StringVar(value=c['name'] if column=='#2' else str(c.get('precision_digits',2)))
+        entry=ttk.Entry(self.config_tree,textvariable=value);entry.place(x=box[0],y=box[1],width=box[2],height=box[3]);entry.focus_set();entry.selection_range(0,'end')
+        def commit(_=None):
+            cfg=json.loads(dumps(self.cfg));changed=cfg['columns'][int(key)]
+            if column=='#2':
+                old=changed['name'];changed['name']=txt(value.get())
+                for child in cfg['columns']:
+                    if child.get('abs_reference')==old:child['abs_reference']=changed['name']
+            else:changed.update(precision_options('小数位',value.get()))
+            validate_config(cfg);self.cfg=cfg;entry.destroy();self.mark_config_dirty();self.render_config()
+        entry.bind('<Return>',lambda e:self.guard(commit));entry.bind('<Escape>',lambda e:entry.destroy())
+        entry.bind('<FocusOut>',lambda e:entry.destroy() if entry.winfo_exists() else None)
+
+    def append_report_columns(self,columns):
+        cfg=json.loads(dumps(self.cfg));existing={norm(c['name']) for c in cfg['columns']}
+        for c in columns:
+            base=c['name'];n=2
+            while norm(c['name']) in existing:c['name']=base+' '+str(n);n+=1
+            existing.add(norm(c['name']));cfg['columns'].append(c)
+        validate_config(cfg);self.cfg=cfg;self.mark_config_dirty();self.render_config()
+
+    def reference_abs_dialog(self):
+        self.require_panel();self.refresh_parent_options()
+        if not self.parent_options:raise ValueError('请先在另一个Panel配置并保存Beads回算ABS')
+        win=tk.Toplevel(self);win.title('引用其他Panel的ABS');win.transient(self);win.grab_set()
+        self.label(win,'选择要引用的ABS（只列出其他Panel的Beads回算ABS）')
+        source=tk.StringVar(value=next(iter(self.parent_options)))
+        ttk.Combobox(win,textvariable=source,values=list(self.parent_options),state='readonly',width=48).pack(padx=16,pady=12)
+        def apply():
+            o=self.parent_options[source.get()]
+            self.append_report_columns([dict(name=o['source'],source=o['source'],mode='parent_abs',kind='pct100',direct_abs=True,parent_panel=o['panel'],parent_panel_name=o['panel_name'],parent_source=o['source'],parent_replicates='unique',parent_confirmed=True)])
+            win.destroy()
+        self.button(win,'添加引用',apply)
+
+    def bulk_abs_dialog(self):
+        self.require_panel();selected=self.config_tree.selection()
+        if not selected:raise ValueError('请先多选要生成ABS的Events或百分比指标')
+        columns=[self.cfg['columns'][int(k)] for k in selected]
+        if any(c['mode']!='raw' or c['kind']=='text' for c in columns):raise ValueError('请选择原始Events或百分比指标')
+        win=tk.Toplevel(self);win.title('批量生成ABS');win.transient(self);win.grab_set()
+        self.label(win,f'为选中的 {len(columns)} 个指标生成ABS')
+        refs={c['name']:c for c in self.cfg['columns'] if c.get('direct_abs')}
+        choice=tk.StringVar(value='用Beads回算' if all(c['kind']=='events' for c in columns) else (next(iter(refs)) if refs else '用Beads回算'))
+        ttk.Label(win,text='用哪个ABS / 计算方式').pack(anchor='w',padx=16)
+        ttk.Combobox(win,textvariable=choice,values=['用Beads回算']+list(refs),state='readonly',width=45).pack(padx=16,pady=8)
+        kind=tk.StringVar(value='百分比0–100');ttk.Combobox(win,textvariable=kind,values=['百分比0–100','比例0–1'],state='readonly',width=20).pack(padx=16,pady=6)
+        preview=tk.StringVar();ttk.Label(win,textvariable=preview,wraplength=580).pack(padx=16,pady=12)
+        def describe(*_):
+            prefix='Events / Beads Events × 每管Beads总数 / 血量' if choice.get()=='用Beads回算' else choice.get()+' × 所选百分比'+(' / 100' if kind.get()=='百分比0–100' else '')
+            preview.set(prefix+'\n'+('；'.join(c['name'] for c in columns))+'\n请选用占上述ABS对应细胞群的百分比。')
+        choice.trace_add('write',describe);kind.trace_add('write',describe);describe()
+        def apply():
+            generated=[]
+            for c in columns:
+                new=dict(name='ABS '+c['name'],source=c['source'],mode='abs',kind='events',precision_mode='decimals',precision_digits=1)
+                if choice.get()=='用Beads回算':
+                    if c['kind']!='events':raise ValueError('Beads回算只接受Events指标，请检查所选项')
+                else:
+                    if c['kind'] not in ('pct100','pct1','number'):raise ValueError('请选百分比指标，不能把Events当百分比')
+                    parent=refs[choice.get()]
+                    new.update({k:v for k,v in parent.items() if k.startswith('parent_')})
+                    new.update(mode='parent_abs',kind='pct100' if kind.get()=='百分比0–100' else 'pct1',abs_reference=parent['name'],parent_confirmed=True)
+                generated.append(new)
+            self.append_report_columns(generated);win.destroy()
+        self.button(win,'按以上关系生成ABS',apply)
+
+    def check_method_config(self):
+        cfg=self.ui_config();issues=[]
+        for c in resolve_abs_references(cfg)['columns']:
+            if c['mode']=='parent_abs':
+                try:self.store.parent_source_config(self.panel_id,c)
+                except ValueError as exc:issues.append(c['name']+'：'+str(exc))
+        rows=self.store.records(self.panel_id,['current']);keys=set()
+        for r in rows:keys.update(json.loads(r['payload'])['raw'])
+        if rows:
+            for c in cfg['columns']:
+                if not c.get('direct_abs') and norm(c['source']) not in keys:issues.append(c['name']+'：已导入数据未找到来源列 '+c['source'])
+        messagebox.showinfo('方法配置检查','\n'.join(issues) if issues else '配置关系检查通过。'+('尚无数据，来源列将在导入后核对。' if not rows else 'Run参数和样本问题请在项目检查中查看。'),parent=self)
+
+    def method_library_dialog(self):
+        if not self.pid:raise ValueError('请先选择项目')
+        self.store.db.execute('CREATE TABLE IF NOT EXISTS method_templates(id INTEGER PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(name,version))');self.store.db.commit()
+        win=tk.Toplevel(self);win.title('方法模板与项目复制');win.transient(self);win.grab_set()
+        frame=ttk.Frame(win,padding=18);frame.pack(fill='both',expand=True)
+        name=tk.StringVar();version=tk.StringVar(value='1');project=tk.StringVar();selected=tk.StringVar()
+        for label,var in [('方法名称',name),('方法版本',version),('新项目名称',project)]:
+            row=ttk.Frame(frame);row.pack(fill='x',pady=5);ttk.Label(row,text=label,width=14).pack(side='left');ttk.Entry(row,textvariable=var,width=38).pack(side='left')
+        box=ttk.Combobox(frame,textvariable=selected,state='readonly',width=52);box.pack(fill='x',pady=12);bundles={}
+        def reload():
+            bundles.clear()
+            for row in self.store.db.execute('SELECT * FROM method_templates ORDER BY name,version'):bundles[row['name']+' / '+row['version']]=json.loads(row['payload'])
+            box['values']=list(bundles)
+            if bundles:selected.set(next(iter(bundles)))
+        def snapshot():
+            self.save_config_ui()
+            if not txt(name.get()) or not txt(version.get()):raise ValueError('请输入方法名称和版本')
+            return method_snapshot(self.store,self.pid,txt(name.get()),txt(version.get()))
+        def save():
+            bundle=snapshot()
+            with self.store.db:self.store.db.execute('INSERT INTO method_templates(name,version,payload) VALUES(?,?,?)',(bundle['name'],bundle['version'],dumps(bundle)))
+            reload();selected.set(bundle['name']+' / '+bundle['version'])
+        def create(current=False):
+            bundle=snapshot() if current else bundles.get(selected.get())
+            if bundle is None:raise ValueError('请选择方法模板')
+            pid=create_method_project(self.store,bundle,project.get());win.destroy();self.refresh_projects(pid)
+        def export():
+            bundle=bundles.get(selected.get())
+            if bundle is None:raise ValueError('请选择方法模板')
+            path=filedialog.asksaveasfilename(parent=win,defaultextension='.json',filetypes=[('方法模板','*.json')])
+            if path:Path(path).write_text(json.dumps(bundle,ensure_ascii=False,indent=2),encoding='utf-8')
+        def import_template():
+            path=filedialog.askopenfilename(parent=win,filetypes=[('方法模板','*.json')])
+            if not path:return
+            bundle=json.loads(Path(path).read_text(encoding='utf-8-sig'))
+            if bundle.get('format')!='express7-method-v1' or not bundle.get('panels'):raise ValueError('不是有效的方法模板')
+            with self.store.db:self.store.db.execute('INSERT INTO method_templates(name,version,payload) VALUES(?,?,?)',(bundle['name'],bundle['version'],dumps(bundle)))
+            reload()
+        for label,action in [('保存当前整套配置为方法模板',save),('从选中模板创建项目',lambda:create(False)),('直接复制当前项目配置',lambda:create(True)),('导出选中模板',export),('导入方法模板',import_template)]:
+            actions=ttk.Frame(frame);actions.pack(fill='x',pady=2);self.button(actions,label,action)
+        ttk.Label(frame,text='只复制配置；不复制样本、Run参数或来源管选择。模板更新不影响已有项目。',wraplength=460).pack(pady=12)
+        reload()
+
+
+    def edit_linked_abs(self,i):
+        c=self.cfg['columns'][i];win=tk.Toplevel(self);win.title('编辑ABS汇报项');win.transient(self);win.grab_set()
+        name=tk.StringVar(value=c['name']);digits=tk.StringVar(value=str(c.get('precision_digits',1)))
+        self.label(win,'来源：'+(c.get('abs_reference')+' × '+c['source'] if c.get('abs_reference') else abs_source_label(c)))
+        for label,var in [('输出名称',name),('小数位',digits)]:
+            row=ttk.Frame(win);row.pack(fill='x',padx=16,pady=8);ttk.Label(row,text=label).pack(side='left');ttk.Entry(row,textvariable=var,width=35).pack(side='left',padx=12)
+        rule=tk.StringVar(value='同Run复管均值' if c.get('parent_replicates')=='mean' else '唯一一管，多条时手动选择')
+        if c.get('direct_abs'):
+            ttk.Label(win,text='同一样本找到多条来源时').pack(padx=16,pady=6)
+            ttk.Combobox(win,textvariable=rule,values=['唯一一管，多条时手动选择','同Run复管均值'],state='readonly',width=35).pack(padx=16,pady=6)
+        def save():
+            cfg=json.loads(dumps(self.cfg))
+            if c.get('direct_abs'):cfg['columns'][i]['parent_replicates']='mean' if rule.get()=='同Run复管均值' else 'unique'
+            old=cfg['columns'][i]['name'];cfg['columns'][i].update(name=txt(name.get()),**precision_options('小数位',digits.get()))
+            for child in cfg['columns']:
+                if child.get('abs_reference')==old:child['abs_reference']=txt(name.get())
+            validate_config(cfg);self.cfg=cfg;self.mark_config_dirty();self.render_config();win.destroy()
+        self.button(win,'应用',save)
+
     def edit_column(self):
         selected=self.config_tree.selection()
         if len(selected)!=1: return
         i=int(selected[0]);c=self.cfg['columns'][i];self.refresh_parent_options()
+        if c.get('direct_abs') or c.get('abs_reference'):
+            self.edit_linked_abs(i);return
         win=tk.Toplevel(self);win.title('编辑汇报项');win.transient(self);win.grab_set()
         source=tk.StringVar(value=c['source']);name=tk.StringVar(value=c['name']);mode=tk.StringVar(value='原始值' if c['mode']=='raw' else 'ABS回算')
         kind=tk.StringVar(value=c['kind']);parent=tk.StringVar(value=abs_source_label(c) or '本Panel Beads Events')
@@ -4831,7 +5100,7 @@ class App(tk.Tk):
             ('ABS回算来源',parent,['本Panel Beads Events']+list(self.parent_options)),('父群取管规则',reps,['唯一一管（多管需指定）','同Run rpt复管均值'])],2):
             ttk.Label(win,text=label).grid(row=j,column=0,padx=12,pady=8,sticky='w')
             ttk.Combobox(win,textvariable=var,values=values,state='readonly',width=44).grid(row=j,column=1,padx=12,pady=8)
-        ttk.Checkbutton(win,text='已核对百分比的分母与所选父群ABS一致',variable=confirmed).grid(row=6,column=0,columnspan=2,padx=12,pady=8,sticky='w')
+        ttk.Label(win,text='请选择占所用ABS对应细胞群的百分比').grid(row=6,column=0,columnspan=2,padx=12,pady=8,sticky='w')
         pm=tk.StringVar(value=PRECISION_LABELS[c.get('precision_mode','default')]);pd=tk.StringVar(value=str(c.get('precision_digits',3)))
         ttk.Label(win,text='Summary精度').grid(row=7,column=0,padx=12,pady=8,sticky='w')
         pf=ttk.Frame(win);pf.grid(row=7,column=1,sticky='w',padx=12)
@@ -4849,6 +5118,7 @@ class App(tk.Tk):
                     candidate.update(mode='parent_abs',parent_panel=chosen['panel'],parent_panel_name=chosen['panel_name'],parent_source=chosen['source'],
                         parent_replicates='mean' if reps.get()=='同Run rpt复管均值' else 'unique',parent_confirmed=confirmed.get())
                     if c.get('parent_panel')==chosen['panel'] and c.get('parent_source')==chosen['source']:candidate['parent_choices']=c.get('parent_choices',{})
+            candidate['enabled']=c.get('enabled',True)
             candidate.update(precision_options(pm.get(),pd.get()))
             cfg=json.loads(dumps(self.cfg));cfg['columns'][i]=candidate;validate_config(cfg)
             self.cfg=cfg;self.mark_config_dirty();self.render_config();win.destroy()
@@ -4858,6 +5128,8 @@ class App(tk.Tk):
         panel=self.require_panel();selected=self.config_tree.selection()
         if len(selected)!=1: raise ValueError('请先选中一个跨Panel ABS汇报项')
         i=int(selected[0]);column=self.cfg['columns'][i]
+        if column.get('abs_reference'):
+            column=next(c for c in self.cfg['columns'] if c['name']==column['abs_reference'])
         if column['mode']!='parent_abs': raise ValueError('该汇报项未配置跨Panel父群ABS来源')
         self.store.parent_source_config(panel,column)
         cfg=self.ui_config();groups={}
@@ -4894,7 +5166,10 @@ class App(tk.Tk):
         render()
 
     def remove_columns(self):
-        for i in sorted(map(int,self.config_tree.selection()),reverse=True): self.cfg['columns'].pop(i)
+        selected=set(map(int,self.config_tree.selection()))
+        removed={c['name'] for i,c in enumerate(self.cfg['columns']) if i in selected}
+        if any(c.get('abs_reference') in removed for i,c in enumerate(self.cfg['columns']) if i not in selected):raise ValueError('该ABS仍被子群使用，请先删除相关子群或将它们一起选中删除')
+        for i in sorted(selected,reverse=True): self.cfg['columns'].pop(i)
         self.mark_config_dirty();self.render_config()
 
     def move_column(self,delta):
@@ -5215,6 +5490,7 @@ class App(tk.Tk):
             for rec,p,values,calc,_ in prepared:
                 display=[]
                 for c,v in zip(cfg['columns'],values):
+                    if not c.get('enabled',True):continue
                     if isinstance(v,tuple):v=calc[v[1]][6]
                     display.append(formatted_report_value(v,c))
                 rows.append(dict(iid=str(rec['id']),values=['验证样品' if p.get('sample_kind')=='validation' else 'Summary',p.get('sample_name','')]+[rec['pf'] if h=='P/F' else p['meta'][h] for h in META]+display))
@@ -5224,7 +5500,7 @@ class App(tk.Tk):
             win=tk.Toplevel(self);win.title('报告预览');win.geometry('1200x640');win.transient(self)
             self.label(win,f'符合条件共{len(rows)}条，分页查看。ABS单位为cells/µL；按已保存的汇报精度显示，计算使用未舍入数据。')
             self.label(win,'搜索仅影响预览；缺失项留空，原因见导出报告的待处理问题。待审核候选不自动采用。')
-            table=self.tree(win,['输出工作表','验证样品名称']+META+[c['name'] for c in cfg['columns']])
+            table=self.tree(win,['输出工作表','验证样品名称']+META+[c['name'] for c in cfg['columns'] if c.get('enabled',True)])
             PagedTable(self,table,run_column=2+META.index('Run number')).set_rows(rows,{},None)
         self.run_job('准备报告预览',work,done,refresh=False)
 
@@ -5253,7 +5529,7 @@ class App(tk.Tk):
         p=filedialog.asksaveasfilename(title='导出当前Panel',initialfile=self.panel_box.get()+'_Summary.xlsx',defaultextension='.xlsx',filetypes=[('Excel','*.xlsx')],parent=self)
         if p:
             exclude=self.exclude_fail.get()
-            self.run_job('生成Excel报告',lambda s:s.export(panel,p,exclude),lambda n:messagebox.showinfo('导出完成',f'已导出{n}条当前有效结果。\n{p}\n\n验证样品单独导出，不含ABS。留空项见“汇总问题”，未纳入文件见“批次文件提示”。\n请用Excel打开重算ABS公式；修改Excel不会回写数据库。',parent=self))
+            self.run_job('生成Excel报告',lambda s:s.export(panel,p,exclude),lambda n:messagebox.showinfo('导出完成',f'已导出{n}条当前有效结果。\n{p}\n\n验证样品单独导出，不含ABS。留空项见“汇总问题”，未纳入文件见“批次文件提示”。\nSummary为结果数值，Summary公式页需Excel计算；修改Excel不会回写数据库。',parent=self))
 
     def audit_dialog(self):
         self.require_panel();win=tk.Toplevel(self);win.title('项目操作日志');win.geometry('1000x600')
