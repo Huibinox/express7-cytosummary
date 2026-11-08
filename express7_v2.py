@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.5.1'
+VERSION = '3.5.2'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -540,6 +540,45 @@ def apply_summary_precision(wb,cfg,prepared):
     note=wb['_V2说明']
     literal_row(note,['Summary精度','只对最终汇报值四舍五入；计算明细、ABS中间值及CV取数不舍入。有效数字大数的尾零不额外使用科学计数法。'])
     for col in cfg['columns']:literal_row(note,['汇报精度：'+col['name'],precision_label(col)])
+
+
+def portable_panel_config(store,panel,cfg):
+    result=json.loads(dumps(cfg))
+    result.pop('import_options',None)
+    for c in result['columns']:
+        c.pop('parent_choices',None)
+        if c['mode']=='parent_abs':
+            parent,_,_=store.parent_source_config(panel,resolve_abs_references(cfg,c))
+            c['parent_panel_key']=parent['name'];c['parent_panel_name']=parent['name'];c.pop('parent_panel',None)
+    return result
+
+
+def load_panel_config(store,panel,payload):
+    cfg=strip_retired_config(payload)
+    if isinstance(cfg,dict) and cfg.get('format')=='express7-method-v1':
+        name=store.panel(panel)['name']
+        matches=[p for p in cfg.get('panels',[]) if isinstance(p,dict) and p.get('name')==name]
+        if len(matches)!=1:raise ValueError('旧整套模板中没有唯一的'+name+'配置，请切换到对应Panel后载入；不会自动创建项目或Panel')
+        cfg=matches[0]['config']
+    if not isinstance(cfg,dict) or not isinstance(cfg.get('columns'),list):raise ValueError('请选择单Panel汇报项配置文件')
+    cfg=json.loads(dumps(cfg));current=store.config(panel)
+    # Report templates never replace current import mappings or validation Run assignments.
+    if 'import_options' in current:cfg['import_options']=current['import_options']
+    else:cfg.pop('import_options',None)
+    panels=store.panels(store.panel(panel)['project_id'])
+    for c in cfg['columns']:
+        if not isinstance(c,dict):raise ValueError('汇报项配置格式不正确')
+        c.pop('parent_choices',None)
+        if c.get('mode')=='parent_abs':
+            name=c.pop('parent_panel_key',None) or c.get('parent_panel_name')
+            if not name:raise ValueError('旧配置缺少ABS来源Panel名称，请在来源项目重新导出模板')
+            matches=[p for p in panels if p['name']==name and p['id']!=panel]
+            if len(matches)!=1:raise ValueError('当前项目未找到ABS来源 '+name+'；请先建立该Panel并载入、保存它的ABS汇报项')
+            c['parent_panel']=matches[0]['id'];c['parent_panel_name']=name
+    validate_config(cfg)
+    for c in resolve_abs_references(cfg)['columns']:
+        if c['mode']=='parent_abs':store.parent_source_config(panel,c)
+    return cfg
 
 
 def method_snapshot(store,pid,name,version):
@@ -4784,7 +4823,6 @@ class App(tk.Tk):
         ttk.Entry(search,textvariable=self.column_query,width=22).pack(side='left',padx=8)
         self.button(search,'批量生成ABS',self.bulk_abs_dialog)
         self.button(search,'引用其他Panel ABS',self.reference_abs_dialog)
-        self.button(search,'方法模板 / 复制',self.method_library_dialog)
         self.button(search,'检查配置',self.check_method_config)
         self.config_tree = self.tree(t,['顺序','输出名称（双击修改）','来源表头','方式','来源类型','精度（双击修改）','ABS回算来源','汇报'],[65,150,150,110,90,90,140,65],height=12)
         self.config_tree.bind('<Double-1>',lambda e:self.guard(lambda:self.edit_report_cell(e)))
@@ -5024,50 +5062,6 @@ class App(tk.Tk):
                 if not c.get('direct_abs') and norm(c['source']) not in keys:issues.append(c['name']+'：已导入数据未找到来源列 '+c['source'])
         messagebox.showinfo('方法配置检查','\n'.join(issues) if issues else '配置关系检查通过。'+('尚无数据，来源列将在导入后核对。' if not rows else 'Run参数和样本问题请在项目检查中查看。'),parent=self)
 
-    def method_library_dialog(self):
-        if not self.pid:raise ValueError('请先选择项目')
-        self.store.db.execute('CREATE TABLE IF NOT EXISTS method_templates(id INTEGER PRIMARY KEY,name TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,UNIQUE(name,version))');self.store.db.commit()
-        win=tk.Toplevel(self);win.title('方法模板与项目复制');win.transient(self);win.grab_set()
-        frame=ttk.Frame(win,padding=18);frame.pack(fill='both',expand=True)
-        name=tk.StringVar();version=tk.StringVar(value='1');project=tk.StringVar();selected=tk.StringVar()
-        for label,var in [('方法名称',name),('方法版本',version),('新项目名称',project)]:
-            row=ttk.Frame(frame);row.pack(fill='x',pady=5);ttk.Label(row,text=label,width=14).pack(side='left');ttk.Entry(row,textvariable=var,width=38).pack(side='left')
-        box=ttk.Combobox(frame,textvariable=selected,state='readonly',width=52);box.pack(fill='x',pady=12);bundles={}
-        def reload():
-            bundles.clear()
-            for row in self.store.db.execute('SELECT * FROM method_templates ORDER BY name,version'):bundles[row['name']+' / '+row['version']]=json.loads(row['payload'])
-            box['values']=list(bundles)
-            if bundles:selected.set(next(iter(bundles)))
-        def snapshot():
-            self.save_config_ui()
-            if not txt(name.get()) or not txt(version.get()):raise ValueError('请输入方法名称和版本')
-            return method_snapshot(self.store,self.pid,txt(name.get()),txt(version.get()))
-        def save():
-            bundle=snapshot()
-            with self.store.db:self.store.db.execute('INSERT INTO method_templates(name,version,payload) VALUES(?,?,?)',(bundle['name'],bundle['version'],dumps(bundle)))
-            reload();selected.set(bundle['name']+' / '+bundle['version'])
-        def create(current=False):
-            bundle=snapshot() if current else bundles.get(selected.get())
-            if bundle is None:raise ValueError('请选择方法模板')
-            pid=create_method_project(self.store,bundle,project.get());win.destroy();self.refresh_projects(pid)
-        def export():
-            bundle=bundles.get(selected.get())
-            if bundle is None:raise ValueError('请选择方法模板')
-            path=filedialog.asksaveasfilename(parent=win,defaultextension='.json',filetypes=[('方法模板','*.json')])
-            if path:Path(path).write_text(json.dumps(bundle,ensure_ascii=False,indent=2),encoding='utf-8')
-        def import_template():
-            path=filedialog.askopenfilename(parent=win,filetypes=[('方法模板','*.json')])
-            if not path:return
-            bundle=json.loads(Path(path).read_text(encoding='utf-8-sig'))
-            if bundle.get('format')!='express7-method-v1' or not bundle.get('panels'):raise ValueError('不是有效的方法模板')
-            with self.store.db:self.store.db.execute('INSERT INTO method_templates(name,version,payload) VALUES(?,?,?)',(bundle['name'],bundle['version'],dumps(bundle)))
-            reload()
-        for label,action in [('保存当前整套配置为方法模板',save),('从选中模板创建项目',lambda:create(False)),('直接复制当前项目配置',lambda:create(True)),('导出选中模板',export),('导入方法模板',import_template)]:
-            actions=ttk.Frame(frame);actions.pack(fill='x',pady=2);self.button(actions,label,action)
-        ttk.Label(frame,text='只复制配置；不复制样本、Run参数或来源管选择。模板更新不影响已有项目。',wraplength=460).pack(pady=12)
-        reload()
-
-
     def edit_linked_abs(self,i):
         c=self.cfg['columns'][i];win=tk.Toplevel(self);win.title('编辑ABS汇报项');win.transient(self);win.grab_set()
         name=tk.StringVar(value=c['name']);digits=tk.StringVar(value=str(c.get('precision_digits',1)))
@@ -5213,28 +5207,20 @@ class App(tk.Tk):
         self.status.set('汇报配置已保存。原始数据保留。')
 
     def export_config(self):
-        self.require_panel();cfg=self.ui_config()
-        p=filedialog.asksaveasfilename(title='导出配置',defaultextension='.json',filetypes=[('JSON','*.json')],parent=self)
+        panel=self.require_panel();cfg=portable_panel_config(self.store,panel,self.ui_config())
+        p=filedialog.asksaveasfilename(title='导出当前Panel汇报项模板',initialfile=self.panel_box.get()+'_汇报项.json',defaultextension='.json',filetypes=[('JSON','*.json')],parent=self)
         if p: Path(p).write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding='utf-8')
 
     def import_config(self):
-        self.require_panel()
-        p=filedialog.askopenfilename(title='载入配置',filetypes=[('JSON','*.json')],parent=self)
+        panel=self.require_panel()
+        p=filedialog.askopenfilename(title='载入汇报项到当前Panel',filetypes=[('JSON','*.json')],parent=self)
         if not p:return
-        cfg=strip_retired_config(json.loads(Path(p).read_text(encoding='utf-8-sig')))
-        if isinstance(cfg,dict) and cfg.get('format')=='express7-method-v1':
-            if not self.discard_config():return
-            name=simpledialog.askstring('从整套方法模板创建项目','这是包含多个Panel的方法模板。请输入新项目名称，当前项目不会被覆盖：',initialvalue=txt(cfg.get('name')),parent=self)
-            if name is None:return
-            pid=create_method_project(self.store,cfg,name)
-            self.refresh_projects(pid);self.open_section('汇报项配置')
-            self.status.set('已从方法模板创建项目；各Panel配置及ABS引用关系已载入。')
-            return
-        validate_config(cfg)
+        cfg=load_panel_config(self.store,panel,json.loads(Path(p).read_text(encoding='utf-8-sig')))
         if not self.discard_config():return
         self.cfg=cfg;self.bead_field_var.set(cfg['beads_field']);self.load_tube_names(cfg);self.mark_config_dirty();self.render_config()
         self.load_import_ui()
         self.cv_enabled_var.set(cfg.get('replicate_cv',True));self.cv_threshold_var.set('' if cfg.get('cv_threshold') is None else str(cfg['cv_threshold']))
+        self.status.set('汇报项已载入当前Panel；点击保存配置后生效，原始数据保留。')
 
     def selected_id(self,tree):
         selected=tree.selection()
