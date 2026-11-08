@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.5.0'
+VERSION = '3.5.1'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -584,6 +584,10 @@ def create_method_project(store,bundle,name):
 
 
 def resolve_abs_references(cfg, single=None):
+    if not isinstance(cfg,dict):raise ValueError('配置文件格式不正确：需要JSON配置对象')
+    if cfg.get('format')=='express7-method-v1':raise ValueError('这是整套方法模板，请使用载入配置或方法模板入口创建新项目')
+    if not isinstance(cfg.get('columns'),list) or any(not isinstance(c,dict) for c in cfg['columns']):raise ValueError('配置文件缺少有效的汇报项列表，请选择单Panel配置或整套方法模板')
+    if any(not txt(c.get('name')) for c in cfg['columns']):raise ValueError('汇报项缺少输出名称')
     result=json.loads(dumps(cfg));by_name={c['name']:c for c in result['columns']}
     targets=[dict(single)] if single is not None else result['columns']
     for c in targets:
@@ -5217,7 +5221,16 @@ class App(tk.Tk):
         self.require_panel()
         p=filedialog.askopenfilename(title='载入配置',filetypes=[('JSON','*.json')],parent=self)
         if not p:return
-        cfg=strip_retired_config(json.loads(Path(p).read_text(encoding='utf-8-sig')));validate_config(cfg)
+        cfg=strip_retired_config(json.loads(Path(p).read_text(encoding='utf-8-sig')))
+        if isinstance(cfg,dict) and cfg.get('format')=='express7-method-v1':
+            if not self.discard_config():return
+            name=simpledialog.askstring('从整套方法模板创建项目','这是包含多个Panel的方法模板。请输入新项目名称，当前项目不会被覆盖：',initialvalue=txt(cfg.get('name')),parent=self)
+            if name is None:return
+            pid=create_method_project(self.store,cfg,name)
+            self.refresh_projects(pid);self.open_section('汇报项配置')
+            self.status.set('已从方法模板创建项目；各Panel配置及ABS引用关系已载入。')
+            return
+        validate_config(cfg)
         if not self.discard_config():return
         self.cfg=cfg;self.bead_field_var.set(cfg['beads_field']);self.load_tube_names(cfg);self.mark_config_dirty();self.render_config()
         self.load_import_ui()
