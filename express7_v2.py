@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.5.2'
+VERSION = '3.5.3'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -3232,7 +3232,9 @@ def compact_qc_summary(store, wb, panel, prepared, exported_ids, cfg, exclude_fa
                 calc.cell(n,13,'直接引用其他Panel ABS');calc.cell(n,19,info['panel']+' / '+info['source']+'，直接引用选定父群ABS，不乘百分比')
             new_rows[key]=n
     formula_map={}
-    for key,n in old_direct.items():formula_map["='计算明细'!G"+str(n)]="='计算明细'!G"+str(new_rows[key])
+    for key,n in old_direct.items():
+        source_row=new_rows[key]
+        formula_map["='计算明细'!G"+str(n)]=f"='计算明细'!C{source_row}/'计算明细'!D{source_row}*'计算明细'!E{source_row}/'计算明细'!F{source_row}"
     for key,n in old_parent.items():formula_map["='跨Panel回算'!J"+str(n)]="='计算明细'!G"+str(new_rows[key])
     for name in ('Summary','验证样品'):
         if name in wb.sheetnames:

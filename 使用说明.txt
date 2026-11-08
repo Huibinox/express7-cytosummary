@@ -1,3 +1,6 @@
+V3.5.3 ABS公式展示更新
+Summary公式页的本Panel Beads回算ABS直接使用计算明细的Events / Beads Events × Beads总数 / 血量四个输入单元格，不再仅引用已计算ABS。精度设置仍由外层ROUND处理，Summary数值页及计算口径不变。跨Panel引用和回算沿用原有公式与追溯。更新软件后重新导出即可。
+
 V3.5.2 单Panel汇报项模板
 汇报项只按当前Panel保存、导出和载入，不再提供多Panel方法模板入口，也不会自动新建项目。
 跨Panel ABS模板按来源Panel名称重新关联当前项目，需先载入并保存来源Panel的ABS配置。模板不携带具体来源记录选择，不修改当前项目的导入字段映射和验证Run设置。
