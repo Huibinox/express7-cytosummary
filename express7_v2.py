@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.5.3'
+VERSION = '3.5.4'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -314,50 +314,99 @@ def validation_metrics(items):
     return list(fields.values())
 
 
-def add_validation_summary(wb,items,cv,metrics,threshold,settings):
+def add_validation_summary(wb,items,cv,metrics,threshold,settings,report_cfg=None):
+    report_cfg=report_cfg or {};cv_digits=report_cfg.get('cv_digits',2)
     ws=wb.create_sheet('验证Summary',0)
     heads=['验证批次','验证材料','分析员','Cycle（给药周期）','Visit（访视）','采血阶段（W/D）','Pre / Post','时长（h/D）','Run','批次用途','Tube','管组','P/F','记录ID']+metrics
     literal_row(ws,heads)
+    inputs=wb.create_sheet('验证计算明细');literal_row(inputs,['记录ID','指标','未舍入数值'])
+    refs={};formula_cells={}
+    for item in items:
+        for metric in metrics:
+            try:v=metric_number(item['payload']['raw'].get(norm(metric)),metric,infer_kind(metric))
+            except (ValueError,TypeError):continue
+            literal_row(inputs,[item['rec']['id'],metric,v]);refs[(str(item['rec']['id']),metric)]=f"'验证计算明细'!C{inputs.max_row}"
+    def metric_format(metric,value,mean=False):
+        column=next((dict(c) for c in report_cfg.get('columns',[]) if c['mode']=='raw' and norm(c['source'])==norm(metric)),dict(mode='raw',kind=infer_kind(metric)))
+        if mean and column['kind']=='events' and column.get('precision_mode','default')=='default':column['kind']='number'
+        rendered=formatted_report_value(value,column);suffix='%' if rendered.endswith('%') else ''
+        places=len(rendered.rstrip('%').split('.')[1]) if '.' in rendered else 0
+        return '0'+('.'+'0'*places if places else '')+suffix
+    def result_refs(result,metric):
+        if not result:return []
+        return [refs[(ident,metric)] for ident in result[11].split(',') if (ident,metric) in refs]
+    def style_stat(row,label):
+        for cell in ws[row]:cell.fill=PatternFill('solid',fgColor='EDF4FC');cell.font=Font(name='Arial',size=10,bold=True)
+        for col,metric in enumerate(metrics,15):
+            cell=ws.cell(row,col)
+            cell.number_format=('0'+('.'+'0'*cv_digits if cv_digits else '')) if 'CV' in label else metric_format(metric,cell.value,True) if cell.value is not None else '0.00'
+            if 'CV' in label and (cell.value is None or cell.value>threshold):
+                cell.fill=PatternFill('solid',fgColor='FEE4E2');cell.font=Font(name='Arial',size=10,color='B42318',bold=True)
+    def prefix(batch,material,analyst,run,role,label,group):return [batch or '未分批',material,analyst,'','','','','',run,role,label,group,'','']
     groups={}
     for item in items:
-        m=item['payload']['meta'];key=(item['batch'],item['material'],m['Run number'],txt(m['Analyst']))
+        m=item['payload']['meta'];key=(item['batch'],item['material'],m['Run number'],txt(m['Analyst']),item['tube_group'])
         groups.setdefault(key,[]).append(item)
     rows_by_key={(r[0],r[1],r[2],r[3],r[4],r[6]):r for r in cv}
-    for (batch,material,run,analyst),rows in sorted(groups.items(),key=lambda kv:natural_sort_key(str(kv[0]))):
+    for (batch,material,run,analyst,group),rows in sorted(groups.items(),key=lambda kv:natural_sort_key(str(kv[0]))):
         for item in rows:
             m=item['payload']['meta'];split=split_subject({'Time Point':m.get('Timepoint','')})
-            prefix=[batch or '未分批',material,analyst,m.get('Cycle',''),m.get('Visit','')]+[split.get(k,'') for k in ('采血阶段','给药前后','间隔时长')]+[run,item['run_role'],m['Tube'],item['tube_group'],item['rec']['pf'],item['rec']['id']]
-            values=[item['payload']['raw'].get(norm(metric)) for metric in metrics]
-            literal_row(ws,prefix+values)
-        samplegroups=sorted({x['tube_group'] for x in rows if x['role']=='样本管'})
-        for group in samplegroups:
-            for label in ['Average','批内CV%']+(['与Baseline均值CV%'] if batch and rows[0]['run_role']!='Baseline' else []):
-                line=[batch or '未分批',material,analyst,'','','','','',run,rows[0]['run_role'],label,group,'','']
-                details=[]
-                for metric in metrics:
-                    kind='与Baseline均值CV' if label=='与Baseline均值CV%' else '批内CV'
-                    result=rows_by_key.get((kind,material,group+' / 样本管',run,analyst,metric))
-                    value=None;reason='缺少可计算数据'
+            line=[batch or '未分批',material,analyst,m.get('Cycle',''),m.get('Visit','')]+[split.get(k,'') for k in ('采血阶段','给药前后','间隔时长')]+[run,item['run_role'],m['Tube'],group,item['rec']['pf'],item['rec']['id']]
+            for metric in metrics:
+                value=item['payload']['raw'].get(norm(metric))
+                try:value=metric_number(value,metric,infer_kind(metric))
+                except (ValueError,TypeError):pass
+                line.append(value)
+            literal_row(ws,line)
+            for col,metric in enumerate(metrics,15):
+                value=ws.cell(ws.max_row,col).value
+                if isinstance(value,(int,float)):ws.cell(ws.max_row,col).number_format=metric_format(metric,value)
+        if not any(x['role']=='样本管' for x in rows):continue
+        for label in ('Mean','CV%'):
+            literal_row(ws,prefix(batch,material,analyst,run,rows[0]['run_role'],label,group));ri=ws.max_row
+            for col,metric in enumerate(metrics,15):
+                result=rows_by_key.get(('批内CV',material,group+' / 样本管',run,analyst,metric));value=None;formula=None
+                if result:
+                    values=json.loads(result[12]);source=result_refs(result,metric)
+                    if label=='Mean' and values and len(values)==result[7] and len(source)==len(values):
+                        value=statistics.mean(values);formula='=AVERAGE('+','.join(source)+')'
+                    elif label=='CV%' and result[8] is not None:
+                        value=result[8];args=','.join(source);formula=f'=STDEV({args})/ABS(AVERAGE({args}))*100'
+                ws.cell(ri,col,value);ws.cell(ri,col).comment=Comment((result[10]+'；记录ID：'+result[11]) if result else '缺少可计算数据','流式数据汇总工具')
+                if formula:formula_cells[(ri,col)]=formula
+            style_stat(ri,label)
+    comparisons={}
+    for result in cv:
+        if result[0]=='与Baseline均值CV':comparisons.setdefault((result[5],result[1],result[2],result[3],result[4]),{})[result[6]]=result
+    if comparisons:
+        ws.append([]);literal_row(ws,['批间比较：与Baseline均值CV（两个Run均值的样本CV）'])
+        for (description,material,group,run,analyst),results in sorted(comparisons.items()):
+            batch=next(b for b in settings['batches'] if run in b['runs'])
+            for label in ('Baseline Mean','当前Run Mean','与Baseline均值CV%'):
+                literal_row(ws,prefix(batch['name'],material,analyst,run,'Baseline '+batch['baseline'],label,group.removesuffix(' / 样本管')));ri=ws.max_row
+                for col,metric in enumerate(metrics,15):
+                    result=results.get(metric);value=None;formula=None
                     if result:
-                        reason=result[10]+'；记录ID：'+result[11]
-                        if label=='Average':
-                            values=json.loads(result[12])
-                            if values and len(values)==result[7]:value=statistics.mean(values)
-                        else:value=result[8]
-                    line.append(value);details.append(reason)
-                literal_row(ws,line);ri=ws.max_row
-                for cell in ws[ri]:cell.fill=PatternFill('solid',fgColor='EDF4FC');cell.font=Font(name='Arial',size=10,bold=True)
-                for i,reason in enumerate(details,15):
-                    cell=ws.cell(ri,i);cell.number_format='0.00';cell.comment=Comment(reason,'流式数据汇总工具')
-                    if label!='Average' and (cell.value is None or cell.value>threshold):
-                        cell.fill=PatternFill('solid',fgColor='FEE4E2');cell.font=Font(name='Arial',size=10,color='B42318',bold=True)
-    ws.freeze_panes='O2';ws.auto_filter.ref=ws.dimensions
+                        means=json.loads(result[12]);source=result_refs(result,metric)
+                        # Only a complete, unique pair of three-tube means has six source records.
+                        if len(means)==2 and len(source)==6 and '多个分析员' not in result[10]:
+                            base='AVERAGE('+','.join(source[:3])+')';current='AVERAGE('+','.join(source[3:])+')'
+                            if label=='Baseline Mean':value=means[0];formula='='+base
+                            elif label=='当前Run Mean':value=means[1];formula='='+current
+                            elif result[8] is not None:value=result[8];formula=f'=STDEV({base},{current})/ABS(AVERAGE({base},{current}))*100'
+                    ws.cell(ri,col,value);ws.cell(ri,col).comment=Comment((result[10]+'；记录ID：'+result[11]) if result else '缺少比较数据','流式数据汇总工具')
+                    if formula:formula_cells[(ri,col)]=formula
+                style_stat(ri,label)
+    ws.freeze_panes='O2'
     for i in range(1,ws.max_column+1):ws.column_dimensions[get_column_letter(i)].width=22
-    ws.column_dimensions['K'].width=28
+    ws.column_dimensions['K'].width=30
+    formulas=wb.copy_worksheet(ws);formulas.title='验证Summary公式';wb.move_sheet(formulas,offset=1-wb.index(formulas))
+    for (row,col),formula in formula_cells.items():formulas.cell(row,col,formula)
+    inputs.freeze_panes='C2'
+    for col in ('A','B','C'):inputs.column_dimensions[col].width=26
+    wb.calculation.fullCalcOnLoad=True;wb.calculation.forceFullCalc=True
     note=wb['计算说明']
-    literal_row(note,['验证批次',dumps(settings.get('batches',[]))])
-    literal_row(note,['未分批','仍输出全部原始管与批内CV；不推测Baseline，不计算与Baseline均值CV。'])
-    literal_row(note,['汇总取数','全部当前记录，所有原始数值指标；不同材料/样本管组分别统计。超限标红不拦截、不自动判P/F。'])
+    for pair in [('验证批次',dumps(settings.get('batches',[]))),('未分批','全部原始管及批内统计仍可导出；不推测Baseline。'),('双页','验证Summary为数值；验证Summary公式为同布局公式。统计引用验证计算明细的未舍入数值；Control不参与。'),('精度','Mean跟随对应原始指标精度，CV沿用当前Panel的独立CV小数位。'),('批间比较','仅在末尾展示与Baseline均值CV；不改变既有计算口径，不是ANOVA批间精密度。')]:literal_row(note,pair)
 
 
 def sample_tube_tag(tube):
@@ -2309,9 +2358,10 @@ class Store:
             for c in sheet[1]:c.font=Font(bold=True);c.fill=PatternFill('solid',fgColor='E9EFF5')
             for i in range(1,sheet.max_column+1):sheet.column_dimensions[get_column_letter(i)].width=22
         for row in ws.iter_rows(min_row=2):
-            row[8].number_format='0.00'
+            digits=self.config(panel).get('cv_digits',2)
+            row[8].number_format='0'+('.'+'0'*digits if digits else '')
             if row[10].value!='达标':row[10].font=Font(color='B42318')
-        add_validation_summary(wb,items,cv,selected_metrics,threshold,self.validation_config(panel))
+        add_validation_summary(wb,items,cv,selected_metrics,threshold,self.validation_config(panel),self.config(panel))
         style_export_workbook(wb);wb.save(path);wb.close()
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO exclusions VALUES(?)',(str(path),))
