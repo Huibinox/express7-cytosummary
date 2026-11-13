@@ -28,7 +28,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-VERSION = '3.5.4'
+VERSION = '3.5.5'
 RAW_META = ['Experiment', 'Specimen', 'Analyst', 'Date', 'Time', 'Tube']
 INPUT_FIELDS = RAW_META + ['BAS ID','Subject ID','Run number','Cycle','Visit','Timepoint']
 META = ['Experiment', 'Subject ID', 'Cycle', 'Visit', 'Timepoint', 'Run number', 'BAS ID', 'P/F', 'Analyst', 'Date', 'Time', 'Tube']
@@ -397,10 +397,11 @@ def add_validation_summary(wb,items,cv,metrics,threshold,settings,report_cfg=Non
                     ws.cell(ri,col,value);ws.cell(ri,col).comment=Comment((result[10]+'；记录ID：'+result[11]) if result else '缺少比较数据','流式数据汇总工具')
                     if formula:formula_cells[(ri,col)]=formula
                 style_stat(ri,label)
-    ws.freeze_panes='O2'
+    ws.freeze_panes='A2'
     for i in range(1,ws.max_column+1):ws.column_dimensions[get_column_letter(i)].width=22
     ws.column_dimensions['K'].width=30
     formulas=wb.copy_worksheet(ws);formulas.title='验证Summary公式';wb.move_sheet(formulas,offset=1-wb.index(formulas))
+    formulas.freeze_panes='A2'
     for (row,col),formula in formula_cells.items():formulas.cell(row,col,formula)
     inputs.freeze_panes='C2'
     for col in ('A','B','C'):inputs.column_dimensions[col].width=26
